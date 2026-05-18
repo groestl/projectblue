@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Suppress noisy embedded-postgres startup logs -->
+    <logger name="io.zonky" level="WARN"/>
+    <!-- Suppress pgjdbc connection lifecycle noise -->
+    <logger name="org.postgresql" level="WARN"/>
+    <!-- pgjava harness at INFO so we can see embedded vs external PG selection -->
+    <logger name="org.pgjava.harness" level="INFO"/>
+    <!-- Everything else at WARN during tests -->
+    <root level="WARN">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

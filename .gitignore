@@ -1,0 +1,23 @@
+# Build output
+build/
+.gradle/
+out/
+
+# Generated ANTLR sources
+src/main/generated-src/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.class
+
+# Gradle wrapper jar — intentionally tracked so ./gradlew works without pre-installed Gradle
+# gradle/wrapper/gradle-wrapper.jar
+
+# Native lib extraction cache
+*.so.tmp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.20.xsd">
+
+    <changeSet id="1" author="pgjava-test">
+        <createTable tableName="customers">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="name" type="VARCHAR(100)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="email" type="VARCHAR(200)">
+                <constraints nullable="false" unique="true"/>
+            </column>
+            <column name="active" type="BOOLEAN" defaultValueBoolean="true">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="2" author="pgjava-test">
+        <insert tableName="customers">
+            <column name="name" value="Alice"/>
+            <column name="email" value="alice@example.com"/>
+        </insert>
+        <insert tableName="customers">
+            <column name="name" value="Bob"/>
+            <column name="email" value="bob@example.com"/>
+        </insert>
+        <insert tableName="customers">
+            <column name="name" value="Carol"/>
+            <column name="email" value="carol@example.com"/>
+        </insert>
+    </changeSet>
+
+    <changeSet id="3" author="pgjava-test">
+        <addColumn tableName="customers">
+            <column name="score" type="INT" defaultValueNumeric="0">
+                <constraints nullable="false"/>
+            </column>
+        </addColumn>
+        <update tableName="customers">
+            <column name="score" valueNumeric="10"/>
+            <where>name = 'Alice'</where>
+        </update>
+    </changeSet>
+
+</databaseChangeLog>

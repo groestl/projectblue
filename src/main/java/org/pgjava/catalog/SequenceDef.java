@@ -18,7 +18,9 @@ public final class SequenceDef {
     private final boolean cycle;
 
     private final AtomicLong current;
-    private volatile Long    lastValue = null; // last value returned by nextval in this session
+    // Per-session (per-thread) tracking of the last value returned by nextval.
+    // volatile Long on the shared SequenceDef leaks across sessions; ThreadLocal isolates correctly.
+    private final ThreadLocal<Long> lastValue = new ThreadLocal<>();
 
     public SequenceDef(long oid, String name, String schemaName,
                        long start, long increment, long minVal, long maxVal, boolean cycle) {
@@ -60,15 +62,19 @@ public final class SequenceDef {
         if (increment > 0 && next > maxVal) {
             if (!cycle) throw PgErrorException.error("2200H",
                     "nextval: reached maximum value of sequence \"" + name + "\" (" + maxVal + ")").build();
-            current.set(minVal);
-            next = minVal;
+            // Wrap to effective minimum (default 1 for ascending sequences)
+            long wrapTo = (minVal == Long.MIN_VALUE) ? 1L : minVal;
+            current.set(wrapTo);
+            next = wrapTo;
         } else if (increment < 0 && next < minVal) {
             if (!cycle) throw PgErrorException.error("2200H",
                     "nextval: reached minimum value of sequence \"" + name + "\" (" + minVal + ")").build();
-            current.set(maxVal);
-            next = maxVal;
+            // Wrap to effective maximum (default -1 for descending sequences)
+            long wrapTo = (maxVal == Long.MAX_VALUE) ? -1L : maxVal;
+            current.set(wrapTo);
+            next = wrapTo;
         }
-        lastValue = next;
+        lastValue.set(next);
         return next;
     }
 
@@ -78,21 +84,31 @@ public final class SequenceDef {
      * @throws SQLException SQLSTATE 55000 if nextval has not been called yet in this session
      */
     public long currval() throws SQLException {
-        if (lastValue == null)
+        Long val = lastValue.get();
+        if (val == null)
             throw PgErrorException.error("55000",
                     "currval of sequence \"" + name + "\" is not yet defined in this session").build();
-        return lastValue;
+        return val;
     }
 
-    /** Set the sequence's current value. */
+    /** Set the sequence's current value (is_called=true: currval/lastval return this value). */
     public void setval(long value) {
         current.set(value);
-        lastValue = value;
+        lastValue.set(value);
+    }
+
+    /**
+     * Set the sequence's next value without marking it "called"
+     * (is_called=false: next nextval() returns this value; currval/lastval unchanged).
+     */
+    public void setvalNotCalled(long value) {
+        current.set(value - increment);
+        lastValue.remove();
     }
 
     /** Reset the sequence to its start value (for TRUNCATE ... RESTART IDENTITY). */
     public void restart() {
         current.set(start - increment);
-        lastValue = null;
+        lastValue.remove();
     }
 }

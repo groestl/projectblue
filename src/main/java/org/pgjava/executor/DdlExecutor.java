@@ -20,15 +20,25 @@ import java.util.stream.Collectors;
 public final class DdlExecutor {
 
     private final Database           db;
-    private final PgTypeRegistry     types = PgTypeRegistry.INSTANCE;
+    private final PgTypeRegistry     types;
     private       Evaluator          eval;   // set lazily by Session after construction
+    private       org.pgjava.wal.Transaction activeTx; // null outside explicit transactions
 
     public DdlExecutor(Database db) {
-        this.db = db;
+        this.db    = db;
+        this.types = db.typeRegistry();
     }
 
     /** Called by Session to wire in the expression evaluator (needed for ADD COLUMN DEFAULT). */
     public void setEvaluator(Evaluator evaluator) { this.eval = evaluator; }
+
+    /** Called by Session before and after each DDL statement to provide rollback context. */
+    public void setCurrentTransaction(org.pgjava.wal.Transaction tx) { this.activeTx = tx; }
+
+    /** Register a catalog undo action with the active transaction (if any). */
+    private void registerUndo(Runnable undo) {
+        if (activeTx != null) activeTx.addCatalogUndo(undo);
+    }
 
     // =========================================================================
     // CREATE TABLE
@@ -117,9 +127,15 @@ public final class DdlExecutor {
             if (c != null) constraints.add(c);
         }
 
+        // Check existence before creation (for IF NOT EXISTS + undo tracking)
+        Schema targetSchema = db.catalog().getSchemaOrNull(schemaName);
+        boolean alreadyExists = targetSchema != null && targetSchema.hasTable(tableName.toLowerCase());
+
         // Create the table in catalog (auto-creates PK index in catalog)
         TableDef t = db.catalog().createTable(schemaName, tableName,
                 cols, constraints, s.temp(), s.ifNotExists());
+
+        if (alreadyExists) return; // IF NOT EXISTS — table was pre-existing, nothing to undo
 
         // Register heap table in storage
         db.storage().createTable(t);
@@ -129,6 +145,15 @@ public final class DdlExecutor {
             org.pgjava.types.PgCollation idxColl = resolveIndexCollation(t, idx);
             db.storage().createIndex(idx, idxColl);
         }
+
+        // Rollback: drop the table from storage and catalog
+        final long tableOid = t.oid();
+        final String finalSchema = schemaName, finalName = tableName;
+        registerUndo(() -> {
+            db.storage().dropTable(tableOid);
+            try { db.catalog().dropTable(finalSchema, finalName, true, false); }
+            catch (Exception e) { /* best-effort */ }
+        });
     }
 
     // =========================================================================
@@ -208,9 +233,14 @@ public final class DdlExecutor {
                         .map(IndexColumn::column)
                         .collect(Collectors.joining("_")) + "_idx";
 
+        // Check pre-existence for IF NOT EXISTS + undo tracking
+        Schema indexSchema = db.catalog().getSchemaOrNull(t.schemaName());
+        boolean idxAlreadyExists = indexSchema != null && indexSchema.index(indexName) != null;
+
         IndexDef idx = db.catalog().createIndex(
                 t.schemaName(), indexName, t.name(),
                 idxCols, s.unique(), s.ifNotExists());
+        if (idxAlreadyExists) return; // IF NOT EXISTS — pre-existing
         org.pgjava.types.PgCollation idxColl = resolveIndexCollation(t, idx);
         org.pgjava.storage.BTreeIndex btree = db.storage().createIndex(idx, idxColl);
 
@@ -226,6 +256,15 @@ public final class DdlExecutor {
                 }
             }
         }
+
+        // Rollback: drop the index
+        final long idxOid = idx.oid();
+        final String idxSchema = t.schemaName(), idxName = indexName;
+        registerUndo(() -> {
+            db.storage().dropIndex(idxOid);
+            try { db.catalog().dropIndex(idxSchema, idxName, true, false); }
+            catch (Exception e) { /* best-effort */ }
+        });
     }
 
     /**
@@ -282,8 +321,20 @@ public final class DdlExecutor {
         String schemaName = resolveCreateSchema(s.sequence(), searchPath);
         String seqName    = s.sequence().relName().toLowerCase();
         SeqParams p       = parseSeqOptions(s.options());
+
+        Schema seqSchema = db.catalog().getSchemaOrNull(schemaName);
+        boolean seqAlreadyExists = seqSchema != null && seqSchema.sequence(seqName) != null;
+
         db.catalog().createSequence(schemaName, seqName,
                 p.start, p.increment, p.minVal, p.maxVal, p.cycle, s.ifNotExists());
+
+        if (!seqAlreadyExists) {
+            final String fs = schemaName, fn = seqName;
+            registerUndo(() -> {
+                try { db.catalog().dropSequence(fs, fn, true, false); }
+                catch (Exception e) { /* best-effort */ }
+            });
+        }
     }
 
     // =========================================================================
@@ -342,10 +393,21 @@ public final class DdlExecutor {
             throws SQLException {
         String schemaName = resolveCreateSchema(s.view(), searchPath);
         String viewName   = s.view().relName().toLowerCase();
-        // Extract the SELECT portion from the original CREATE VIEW SQL.
         String viewSql = extractViewSelect(originalSql);
+
+        Schema viewSchema = db.catalog().getSchemaOrNull(schemaName);
+        boolean viewAlreadyExists = viewSchema != null && viewSchema.view(viewName) != null;
+
         db.catalog().createView(schemaName, viewName, viewSql, s.query(),
                 s.aliases() != null ? s.aliases() : List.of(), s.replace());
+
+        if (!viewAlreadyExists) {
+            final String fs = schemaName, fn = viewName;
+            registerUndo(() -> {
+                try { db.catalog().dropView(fs, fn, true, false); }
+                catch (Exception e) { /* best-effort */ }
+            });
+        }
     }
 
     /** Extract the SELECT body from a CREATE VIEW statement. */
@@ -819,7 +881,9 @@ public final class DdlExecutor {
                 case "increment" -> increment = toLong(de.value(), 1L);
                 case "minvalue"  -> minVal    = toLong(de.value(), Long.MIN_VALUE);
                 case "maxvalue"  -> maxVal    = toLong(de.value(), Long.MAX_VALUE);
-                case "cycle"     -> cycle     = toBoolean(de.value(), false);
+                // pg_query: CYCLE → defname="cycle", arg=null (no-arg flag means true)
+                //           NO CYCLE → defname="cycle", arg=Boolean(false)
+                case "cycle"     -> cycle     = de.value() == null || toBoolean(de.value(), false);
                 default          -> { /* cache, no_minvalue, etc. — ignore */ }
             }
         }
@@ -1039,8 +1103,8 @@ public final class DdlExecutor {
             };
 
             long oid = db.catalog().nextOid();
-            // Determine output column name from return type
-            String colName = returnType != null ? returnType.name() : "text";
+            // Column name is the function name (PostgreSQL behavior: SELECT f() → column "f")
+            String colName = funcName;
             var srf = new org.pgjava.catalog.SrfDef(oid, funcName, schemaName,
                     argTypes, java.util.List.of(colName), false, srfImpl);
 
@@ -1116,6 +1180,11 @@ public final class DdlExecutor {
         }
 
         db.catalog().functions().register(fn);
+
+        // Rollback: unregister the function
+        final String finalFuncName = funcName;
+        final List<PgType> finalArgTypes = argTypes;
+        registerUndo(() -> db.catalog().functions().unregisterExact(finalFuncName, finalArgTypes));
     }
 
     // =========================================================================
@@ -1340,8 +1409,19 @@ public final class DdlExecutor {
         }
         int oid = (int) db.catalog().nextOid();
         var enumType = new org.pgjava.types.EnumType(oid, typeName, List.copyOf(s.labels()));
-        // Store only in schema — NOT in global PgTypeRegistry (which is JVM-wide)
         if (schema != null) schema.addType(enumType);
+        // Register in the per-database type registry so the evaluator can resolve it.
+        // This does NOT affect PgTypeRegistry.INSTANCE (other databases).
+        types.register(enumType);
+
+        // Rollback: remove enum type from schema and registry
+        final Schema finalSchema = schema;
+        final String finalTypeName = typeName;
+        final org.pgjava.types.EnumType finalEnumType = enumType;
+        registerUndo(() -> {
+            if (finalSchema != null) finalSchema.removeType(finalTypeName);
+            types.unregister(finalEnumType);
+        });
     }
 
     // ─── CREATE DOMAIN ───────────────────────────────────────────────────────
@@ -1363,8 +1443,18 @@ public final class DdlExecutor {
                 : List.of();
         var domainType = new org.pgjava.types.DomainType(oid, domainName, baseInfo.type(),
                 checkExprs, s.defaultExpr(), s.notNull());
-        // Store only in schema — NOT in global PgTypeRegistry (which is JVM-wide)
         if (schema != null) schema.addType(domainType);
+        // Register in the per-database type registry (not the JVM-global INSTANCE).
+        types.register(domainType);
+
+        // Rollback: remove domain type from schema and registry
+        final Schema finalDomSchema = schema;
+        final String finalDomName = domainName;
+        final org.pgjava.types.DomainType finalDomType = domainType;
+        registerUndo(() -> {
+            if (finalDomSchema != null) finalDomSchema.removeType(finalDomName);
+            types.unregister(finalDomType);
+        });
     }
 
     // ─── ALTER TYPE ... ADD VALUE ────────────────────────────────────────────

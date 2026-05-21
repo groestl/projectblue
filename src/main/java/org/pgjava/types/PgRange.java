@@ -67,15 +67,15 @@ public final class PgRange {
         Object up = upper;
         boolean loInc = lowerInc;
         boolean upInc = upperInc;
-        // Canonicalize lower bound: exclusive → add 1, set inclusive
+        // Canonicalize lower bound: exclusive → add 1, set inclusive (discrete types only)
         if (lo != null && !loInc) {
-            lo = increment(lo);
-            if (lo != null) loInc = true;
+            Object newLo = increment(lo);
+            if (newLo != null) { lo = newLo; loInc = true; }
         }
-        // Canonicalize upper bound: inclusive → add 1, set exclusive
+        // Canonicalize upper bound: inclusive → add 1, set exclusive (discrete types only)
         if (up != null && upInc) {
-            up = increment(up);
-            if (up != null) upInc = false;
+            Object newUp = increment(up);
+            if (newUp != null) { up = newUp; upInc = false; }
         }
         PgRange result = new PgRange(false, lo, up, loInc, upInc,
                 lo == null, up == null);
@@ -194,16 +194,32 @@ public final class PgRange {
     @SuppressWarnings("unchecked")
     public boolean contains(Object element) {
         if (empty || element == null) return false;
-        Comparable<Object> el = (Comparable<Object>) element;
+        // Coerce element to match bound type if needed (e.g. Double → BigDecimal)
+        Object el = coerceTo(element, lower != null ? lower : upper);
+        if (el == null) el = element;
+        Comparable<Object> cel = (Comparable<Object>) el;
         if (!lowerInf()) {
-            int cmp = el.compareTo(lower);
+            int cmp = cel.compareTo(lower);
             if (lowerInc() ? cmp < 0 : cmp <= 0) return false;
         }
         if (!upperInf()) {
-            int cmp = el.compareTo(upper);
+            int cmp = cel.compareTo(upper);
             if (upperInc() ? cmp > 0 : cmp >= 0) return false;
         }
         return true;
+    }
+
+    /** Coerce src to the same type as target when they are numeric but differ in class. */
+    private static Object coerceTo(Object src, Object target) {
+        if (src == null || target == null) return src;
+        if (src.getClass() == target.getClass()) return src;
+        if (target instanceof java.math.BigDecimal && src instanceof Number n)
+            return new java.math.BigDecimal(n.toString());
+        if (target instanceof Long && src instanceof Number n)
+            return n.longValue();
+        if (target instanceof Integer && src instanceof Number n)
+            return n.intValue();
+        return src;
     }
 
     /** Returns true if {@code other} is fully contained in this range. */
@@ -218,6 +234,95 @@ public final class PgRange {
         if (empty || other.empty) return false;
         // They don't overlap iff one ends before the other starts
         return !strictlyBefore(this, other) && !strictlyBefore(other, this);
+    }
+
+    /** Range union: smallest range containing both (throws if non-contiguous). */
+    public PgRange rangeUnion(PgRange other) {
+        if (this.isEmpty()) return other;
+        if (other.isEmpty()) return this;
+        return merge(this, other).canonicalize();
+    }
+
+    /** Range intersection. */
+    public PgRange rangeIntersection(PgRange other) {
+        if (this.isEmpty() || other.isEmpty()) return EMPTY;
+        // Lower bound: max of the two lower bounds
+        Object lo; boolean loInc;
+        int loCmp = compareBounds(this.lower, this.lowerInc, this.lowerInf(),
+                                  other.lower, other.lowerInc, other.lowerInf(), true);
+        if (loCmp >= 0) { lo = this.lower; loInc = this.lowerInc; }
+        else             { lo = other.lower; loInc = other.lowerInc; }
+        // Upper bound: min of the two upper bounds
+        Object up; boolean upInc;
+        int upCmp = compareBounds(this.upper, this.upperInc, this.upperInf(),
+                                  other.upper, other.upperInc, other.upperInf(), false);
+        if (upCmp <= 0) { up = this.upper; upInc = this.upperInc; }
+        else             { up = other.upper; upInc = other.upperInc; }
+        PgRange r = new PgRange(false, lo, up, loInc, upInc, lo == null, up == null);
+        return r.isEmpty() ? EMPTY : r.canonicalize();
+    }
+
+    /** Range difference: this minus other. Only works for simple cases. */
+    public PgRange rangeDifference(PgRange other) {
+        if (other.isEmpty()) return this;
+        if (this.isEmpty()) return EMPTY;
+        PgRange inter = this.rangeIntersection(other);
+        if (inter.isEmpty()) return this;
+        // Check if other starts at or before this
+        int loCmp = compareBounds(other.lower, other.lowerInc, other.lowerInf(),
+                                  this.lower, this.lowerInc, this.lowerInf(), true);
+        if (loCmp <= 0) {
+            // other covers left part, return right part
+            if (other.upperInf()) return EMPTY;
+            Object lo = other.upper;
+            boolean loInc = !other.upperInc;
+            PgRange r = new PgRange(false, lo, this.upper, loInc, this.upperInc, false, this.upperInf());
+            return r.isEmpty() ? EMPTY : r.canonicalize();
+        } else {
+            // other covers right part, return left part
+            if (other.lowerInf()) return EMPTY;
+            Object up = other.lower;
+            boolean upInc = !other.lowerInc;
+            PgRange r = new PgRange(false, this.lower, up, this.lowerInc, upInc, this.lowerInf(), false);
+            return r.isEmpty() ? EMPTY : r.canonicalize();
+        }
+    }
+
+    /** Range adjacency: two ranges are adjacent if they share exactly one boundary point. */
+    public boolean adjacent(PgRange other) {
+        if (this.isEmpty() || other.isEmpty()) return false;
+        // this.upper adjacent to other.lower?
+        if (!this.upperInf() && !other.lowerInf() && this.upper != null && other.lower != null) {
+            @SuppressWarnings("unchecked")
+            int cmp = ((Comparable<Object>) this.upper).compareTo(other.lower);
+            if (cmp == 0 && (this.upperInc != other.lowerInc)) return true;
+        }
+        // other.upper adjacent to this.lower?
+        if (!other.upperInf() && !this.lowerInf() && other.upper != null && this.lower != null) {
+            @SuppressWarnings("unchecked")
+            int cmp = ((Comparable<Object>) other.upper).compareTo(this.lower);
+            if (cmp == 0 && (other.upperInc != this.lowerInc)) return true;
+        }
+        return false;
+    }
+
+    /** Compare two bounds (lower or upper). Returns negative if a < b, 0 if equal, positive if a > b. */
+    private static int compareBounds(Object a, boolean aInc, boolean aInf,
+                                     Object b, boolean bInc, boolean bInf,
+                                     boolean lower) {
+        if (aInf && bInf) return 0;
+        if (aInf) return lower ? -1 : 1;
+        if (bInf) return lower ? 1 : -1;
+        if (a == null && b == null) return 0;
+        if (a == null) return lower ? -1 : 1;
+        if (b == null) return lower ? 1 : -1;
+        @SuppressWarnings("unchecked")
+        int cmp = ((Comparable<Object>) a).compareTo(b);
+        if (cmp != 0) return cmp;
+        // Same value: inclusive vs exclusive
+        if (aInc == bInc) return 0;
+        if (lower) return aInc ? -1 : 1;  // [5,... < (5,...
+        else       return aInc ? 1 : -1;  // ...5] > ...5)
     }
 
     // -------------------------------------------------------------------------

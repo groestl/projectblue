@@ -2,12 +2,15 @@ package org.pgjava.wal;
 
 import org.pgjava.types.PgInterval;
 import org.pgjava.types.PgOid;
+import org.pgjava.types.PgRange;
 
 import java.io.*;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.*;
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -19,6 +22,18 @@ import java.util.UUID;
  * the correct Java type without knowing the schema at decode time.
  *
  * <p>All integers are big-endian.
+ *
+ * <p>Special formats:
+ * <ul>
+ *   <li><b>Arrays</b> ({@code *_ARRAY} OIDs, value type {@code List<Object>}):
+ *       {@code [elemOid: 4][count: 4] (for each: [isNull: 1][?len: 4][?bytes: N])}</li>
+ *   <li><b>Ranges</b> ({@code INT4RANGE} etc., value type {@code PgRange}):
+ *       {@code [flags: 1][?lowerLen: 4][?lowerBytes][?upperLen: 4][?upperBytes]}</li>
+ *   <li><b>BIT / VARBIT</b> (value type {@code BitSet}):
+ *       {@code [bitCount: 4][bytes: ceil(bitCount/8)]}</li>
+ *   <li><b>Enum / user OIDs</b> (OID ≥ {@code FIRST_USER_OID}):
+ *       UTF-8 label string; decoded as {@code String} (caller converts to {@code EnumValue})</li>
+ * </ul>
  */
 public final class WalValueEncoder {
 
@@ -88,15 +103,69 @@ public final class WalValueEncoder {
                 byte[] b = (byte[]) value;
                 dos.write(b);
             }
+            case PgOid.BIT, PgOid.VARBIT -> {
+                BitSet bs = (BitSet) value;
+                int bitCount = bs.length();
+                dos.writeInt(bitCount);
+                byte[] raw = bs.toByteArray();
+                dos.write(raw);
+            }
+            case PgOid.INT4RANGE, PgOid.INT8RANGE, PgOid.NUMRANGE,
+                 PgOid.TSRANGE, PgOid.TSTZRANGE, PgOid.DATERANGE -> {
+                PgRange range = (PgRange) value;
+                encodeRange(dos, range, elementOidForRange(typeOid));
+            }
             default -> {
-                // text, varchar, bpchar, name, json, jsonb, xml, char, unknown → UTF-8 string
-                byte[] s = value.toString().getBytes(StandardCharsets.UTF_8);
-                dos.write(s);
+                if (isArrayOid(typeOid)) {
+                    @SuppressWarnings("unchecked")
+                    List<Object> list = (List<Object>) value;
+                    int elemOid = elementOidForArray(typeOid);
+                    dos.writeInt(elemOid);
+                    dos.writeInt(list.size());
+                    for (Object elem : list) {
+                        if (elem == null) {
+                            dos.writeByte(1); // is_null
+                        } else {
+                            dos.writeByte(0);
+                            byte[] eb = encodeValue(elemOid, elem);
+                            dos.writeInt(eb.length);
+                            dos.write(eb);
+                        }
+                    }
+                } else {
+                    // text, varchar, bpchar, name, json, jsonb, xml, char, unknown,
+                    // user OIDs (enum labels, domain values) → UTF-8 string
+                    byte[] s = value.toString().getBytes(StandardCharsets.UTF_8);
+                    dos.write(s);
+                }
             }
         }
 
         dos.flush();
         return buf.toByteArray();
+    }
+
+    private static void encodeRange(DataOutputStream dos, PgRange range, int elemOid)
+            throws IOException {
+        byte flags = 0;
+        if (range.isEmpty())  flags |= 0x01;
+        if (range.lowerInf()) flags |= 0x02;
+        if (range.upperInf()) flags |= 0x04;
+        if (range.lowerInc()) flags |= 0x08;
+        if (range.upperInc()) flags |= 0x10;
+        dos.writeByte(flags);
+        if (!range.isEmpty()) {
+            if (!range.lowerInf()) {
+                byte[] lb = encodeValue(elemOid, range.lower());
+                dos.writeInt(lb.length);
+                dos.write(lb);
+            }
+            if (!range.upperInf()) {
+                byte[] ub = encodeValue(elemOid, range.upper());
+                dos.writeInt(ub.length);
+                dos.write(ub);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -158,12 +227,125 @@ public final class WalValueEncoder {
                 yield new UUID(hi, lo);
             }
             case PgOid.BYTEA -> bytes.clone();
-            default -> new String(bytes, StandardCharsets.UTF_8);
+            case PgOid.BIT, PgOid.VARBIT -> {
+                int bitCount = dis.readInt();
+                int byteCount = (bitCount + 7) / 8;
+                byte[] raw = byteCount > 0 ? dis.readNBytes(byteCount) : new byte[0];
+                yield BitSet.valueOf(raw);
+            }
+            case PgOid.INT4RANGE, PgOid.INT8RANGE, PgOid.NUMRANGE,
+                 PgOid.TSRANGE, PgOid.TSTZRANGE, PgOid.DATERANGE ->
+                    decodeRange(dis, elementOidForRange(typeOid));
+            default -> {
+                if (isArrayOid(typeOid)) {
+                    int elemOid = dis.readInt();
+                    int count   = dis.readInt();
+                    List<Object> list = new ArrayList<>(count);
+                    for (int i = 0; i < count; i++) {
+                        boolean isNull = dis.readByte() != 0;
+                        if (isNull) {
+                            list.add(null);
+                        } else {
+                            int elemLen   = dis.readInt();
+                            byte[] elemBytes = dis.readNBytes(elemLen);
+                            list.add(decodeValue(elemOid, elemBytes));
+                        }
+                    }
+                    yield list;
+                } else {
+                    yield new String(bytes, StandardCharsets.UTF_8);
+                }
+            }
+        };
+    }
+
+    private static PgRange decodeRange(DataInputStream dis, int elemOid) throws IOException {
+        byte flags    = dis.readByte();
+        boolean empty    = (flags & 0x01) != 0;
+        boolean lowerInf = (flags & 0x02) != 0;
+        boolean upperInf = (flags & 0x04) != 0;
+        boolean lowerInc = (flags & 0x08) != 0;
+        boolean upperInc = (flags & 0x10) != 0;
+        if (empty) return PgRange.EMPTY;
+        Object lower = null;
+        Object upper = null;
+        if (!lowerInf) {
+            int len = dis.readInt();
+            byte[] b = dis.readNBytes(len);
+            lower = decodeValue(elemOid, b);
+        }
+        if (!upperInf) {
+            int len = dis.readInt();
+            byte[] b = dis.readNBytes(len);
+            upper = decodeValue(elemOid, b);
+        }
+        return PgRange.of(lower, upper, lowerInc, upperInc);
+    }
+
+    // -------------------------------------------------------------------------
+    // Array OID helpers
+
+    private static boolean isArrayOid(int oid) {
+        return switch (oid) {
+            case PgOid.BOOL_ARRAY, PgOid.BYTEA_ARRAY, PgOid.CHAR_ARRAY, PgOid.NAME_ARRAY,
+                 PgOid.INT2_ARRAY, PgOid.INT4_ARRAY, PgOid.TEXT_ARRAY, PgOid.OID_ARRAY,
+                 PgOid.FLOAT4_ARRAY, PgOid.FLOAT8_ARRAY, PgOid.MONEY_ARRAY,
+                 PgOid.BPCHAR_ARRAY, PgOid.VARCHAR_ARRAY, PgOid.INT8_ARRAY,
+                 PgOid.DATE_ARRAY, PgOid.TIME_ARRAY, PgOid.TIMESTAMP_ARRAY,
+                 PgOid.TIMESTAMPTZ_ARRAY, PgOid.INTERVAL_ARRAY, PgOid.NUMERIC_ARRAY,
+                 PgOid.UUID_ARRAY, PgOid.JSONB_ARRAY, PgOid.JSON_ARRAY, PgOid.XML_ARRAY,
+                 PgOid.TIMETZ_ARRAY, PgOid.MACADDR_ARRAY, PgOid.INET_ARRAY, PgOid.CIDR_ARRAY,
+                 PgOid.BIT_ARRAY, PgOid.VARBIT_ARRAY -> true;
+            default -> false;
+        };
+    }
+
+    private static int elementOidForArray(int arrayOid) {
+        return switch (arrayOid) {
+            case PgOid.BOOL_ARRAY        -> PgOid.BOOL;
+            case PgOid.BYTEA_ARRAY       -> PgOid.BYTEA;
+            case PgOid.CHAR_ARRAY        -> PgOid.CHAR;
+            case PgOid.NAME_ARRAY        -> PgOid.NAME;
+            case PgOid.INT2_ARRAY        -> PgOid.INT2;
+            case PgOid.INT4_ARRAY        -> PgOid.INT4;
+            case PgOid.TEXT_ARRAY        -> PgOid.TEXT;
+            case PgOid.OID_ARRAY         -> PgOid.OID;
+            case PgOid.FLOAT4_ARRAY      -> PgOid.FLOAT4;
+            case PgOid.FLOAT8_ARRAY      -> PgOid.FLOAT8;
+            case PgOid.BPCHAR_ARRAY      -> PgOid.BPCHAR;
+            case PgOid.VARCHAR_ARRAY     -> PgOid.VARCHAR;
+            case PgOid.INT8_ARRAY        -> PgOid.INT8;
+            case PgOid.DATE_ARRAY        -> PgOid.DATE;
+            case PgOid.TIME_ARRAY        -> PgOid.TIME;
+            case PgOid.TIMESTAMP_ARRAY   -> PgOid.TIMESTAMP;
+            case PgOid.TIMESTAMPTZ_ARRAY -> PgOid.TIMESTAMPTZ;
+            case PgOid.INTERVAL_ARRAY    -> PgOid.INTERVAL;
+            case PgOid.NUMERIC_ARRAY     -> PgOid.NUMERIC;
+            case PgOid.UUID_ARRAY        -> PgOid.UUID;
+            case PgOid.TIMETZ_ARRAY      -> PgOid.TIMETZ;
+            case PgOid.BIT_ARRAY         -> PgOid.BIT;
+            case PgOid.VARBIT_ARRAY      -> PgOid.VARBIT;
+            case PgOid.JSONB_ARRAY       -> PgOid.JSONB;
+            case PgOid.JSON_ARRAY        -> PgOid.JSON;
+            // MONEY, MACADDR, INET, CIDR, XML → treat element as TEXT (no typed encoder)
+            default                      -> PgOid.TEXT;
+        };
+    }
+
+    private static int elementOidForRange(int rangeOid) {
+        return switch (rangeOid) {
+            case PgOid.INT4RANGE  -> PgOid.INT4;
+            case PgOid.INT8RANGE  -> PgOid.INT8;
+            case PgOid.NUMRANGE   -> PgOid.NUMERIC;
+            case PgOid.TSRANGE    -> PgOid.TIMESTAMP;
+            case PgOid.TSTZRANGE  -> PgOid.TIMESTAMPTZ;
+            case PgOid.DATERANGE  -> PgOid.DATE;
+            default -> throw new IllegalArgumentException("Unknown range OID: " + rangeOid);
         };
     }
 
     // -------------------------------------------------------------------------
-    // Helpers
+    // Scalar helpers
 
     private static short  toShort(Object v) {
         if (v instanceof Short s) return s;

@@ -188,6 +188,27 @@ public final class EvalContext {
         return row.get(pos);
     }
 
+    /**
+     * Resolve an entire row by table alias, returning values and column names
+     * as a two-element array: [Object[] values, String[] columnNames].
+     * Returns null if the alias is not found.
+     */
+    public Object[] resolveRowByAlias(String alias) {
+        String key = alias.toLowerCase();
+        Row row = rows.get(key);
+        ColumnMap cm = columnMaps.get(key);
+        if (row == null || cm == null) {
+            // Try empty alias
+            row = rows.get("");
+            cm  = columnMaps.get("");
+        }
+        if (row == null || cm == null) return null;
+        Object[] values = row.values();
+        String[] colNames = new String[cm.nameToIndex().size()];
+        for (var entry : cm.nameToIndex().entrySet()) colNames[entry.getValue()] = entry.getKey();
+        return new Object[]{values, colNames};
+    }
+
     private Object resolveIn(String alias, String col) throws SQLException {
         // Try exact alias match first, then empty-string alias (unnamed row)
         Row row = rows.get(alias);

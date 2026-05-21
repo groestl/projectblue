@@ -53,6 +53,15 @@ public final class PgTypeRegistry {
 
     public static final PgTypeRegistry INSTANCE = new PgTypeRegistry();
 
+    /**
+     * Create a fresh per-database registry pre-populated with all built-in types.
+     * User-defined types registered here do not affect {@link #INSTANCE} or any
+     * other database's registry — this is the fix for cross-database type leakage.
+     */
+    public static PgTypeRegistry newDatabase() {
+        return new PgTypeRegistry();
+    }
+
     private final Map<Integer, PgType>  byOid  = new ConcurrentHashMap<>();
     private final Map<String,  PgType>  byName = new ConcurrentHashMap<>();
 
@@ -91,6 +100,11 @@ public final class PgTypeRegistry {
     public void register(PgType type) {
         byOid.put(type.oid(), type);
         byName.put(type.name().toLowerCase(), type);
+    }
+
+    public void unregister(PgType type) {
+        byOid.remove(type.oid());
+        byName.remove(type.name().toLowerCase());
     }
 
     // -------------------------------------------------------------------------

@@ -18,5 +18,14 @@ public record TriggerContext(
         String[] tgArgv,
         TableDef tableDef,
         Object[] newRow,     // null for DELETE / STATEMENT
-        Object[] oldRow      // null for INSERT / STATEMENT
-) {}
+        Object[] oldRow,     // null for INSERT / STATEMENT
+        String[] columnNames // for INSTEAD OF triggers on views (no tableDef)
+) {
+    /** Compatibility constructor (no column names). */
+    public TriggerContext(String tgName, String tgWhen, String tgLevel, String tgOp,
+                          String tgTableName, String tgTableSchema, String[] tgArgv,
+                          TableDef tableDef, Object[] newRow, Object[] oldRow) {
+        this(tgName, tgWhen, tgLevel, tgOp, tgTableName, tgTableSchema,
+             tgArgv, tableDef, newRow, oldRow, null);
+    }
+}

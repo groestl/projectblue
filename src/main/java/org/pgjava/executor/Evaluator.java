@@ -49,7 +49,7 @@ public final class Evaluator {
     private final FunctionRegistry functions;
     /** Optional per-session functions checked before the shared registry. */
     private FunctionRegistry       sessionFunctions;
-    private final PgTypeRegistry   types;
+    private PgTypeRegistry         types;
     private final PgCollation      defaultCollation;
 
     /** Outer-query context threaded in for correlated subquery evaluation. */
@@ -87,6 +87,16 @@ public final class Evaluator {
         this.functions        = functions;
         this.types            = PgTypeRegistry.INSTANCE;
         this.defaultCollation = defaultCollation;
+    }
+
+    /**
+     * Override the type registry used for CAST and type-name resolution.
+     * Call this with {@code database.typeRegistry()} to ensure user-defined
+     * types (enums, domains) from this database are visible without leaking
+     * from other databases.
+     */
+    public void setTypeRegistry(PgTypeRegistry registry) {
+        this.types = registry;
     }
 
     public PgCollation defaultCollation() { return defaultCollation; }
@@ -134,6 +144,7 @@ public final class Evaluator {
      */
     public Evaluator withOuterContext(EvalContext outerCtx) {
         Evaluator child = new Evaluator(functions, defaultCollation);
+        child.types              = this.types;
         child.outerCtx           = outerCtx;
         child.subqueryExecutor   = this.subqueryExecutor;
         child.sessionFunctions   = this.sessionFunctions;
@@ -313,11 +324,13 @@ public final class Evaluator {
             case "@>"  -> evalContains(left, right);
             case "<@"  -> evalContainedBy(left, right);
             case "&&"  -> evalOverlaps(left, right);
+            case "-|-" -> evalRangeAdjacent(left, right);
             // JSON operators
             case "->"  -> JsonOps.extractJson(asJsonString(left), right);
             case "->>" -> JsonOps.extractText(asJsonString(left), right);
             case "#>"  -> JsonOps.extractPath(asJsonString(left), right);
             case "#>>" -> JsonOps.extractPathText(asJsonString(left), right);
+            case "#-"  -> JsonOps.jsonDeletePath(asJsonString(left), right);
             case "?"   -> JsonOps.keyExists(asJsonString(left), asString(right));
             case "?|"  -> JsonOps.anyKeyExists(asJsonString(left), right);
             case "?&"  -> JsonOps.allKeysExist(asJsonString(left), right);
@@ -565,6 +578,23 @@ public final class Evaluator {
     private Object arith(Object l, Object r, String op) throws SQLException {
         if (l == null || r == null) return null;
 
+        // JSONB delete: jsonb - text (key) or jsonb - int (index)
+        if ("-".equals(op)) {
+            String lj = asJsonString(l);
+            if (lj != null) return JsonOps.jsonDelete(lj, r);
+        }
+
+        // Range arithmetic: +, *, -
+        if (l instanceof org.pgjava.types.PgRange lr && r instanceof org.pgjava.types.PgRange rr) {
+            return switch (op) {
+                case "+" -> lr.rangeUnion(rr);
+                case "*" -> lr.rangeIntersection(rr);
+                case "-" -> lr.rangeDifference(rr);
+                default  -> throw PgErrorException.error("42883",
+                        "operator does not exist: range " + op + " range").build();
+            };
+        }
+
         // numeric × numeric → numeric
         if (l instanceof BigDecimal || r instanceof BigDecimal) {
             BigDecimal a = toBigDecimal(l), b = toBigDecimal(r);
@@ -774,6 +804,15 @@ public final class Evaluator {
             if (r instanceof org.pgjava.types.PgRange rr) return lr.containsRange(rr);
             return lr.contains(r);
         }
+        // Array @> Array: all elements of r are in l
+        if (l instanceof List<?> la && r instanceof List<?> ra) {
+            for (Object re : ra) {
+                boolean found = false;
+                for (Object le : la) { if (java.util.Objects.equals(le, re)) { found = true; break; } }
+                if (!found) return Boolean.FALSE;
+            }
+            return Boolean.TRUE;
+        }
         // JSONB @> JSONB
         String ls = asJsonString(l), rs = asJsonString(r);
         if (ls != null && rs != null) return JsonOps.jsonContains(ls, rs);
@@ -786,6 +825,15 @@ public final class Evaluator {
             if (l instanceof org.pgjava.types.PgRange lr) return rr.containsRange(lr);
             return rr.contains(l);
         }
+        // Array <@ Array: all elements of l are in r
+        if (l instanceof List<?> la && r instanceof List<?> ra) {
+            for (Object le : la) {
+                boolean found = false;
+                for (Object re : ra) { if (java.util.Objects.equals(le, re)) { found = true; break; } }
+                if (!found) return Boolean.FALSE;
+            }
+            return Boolean.TRUE;
+        }
         // JSONB <@ JSONB
         String ls = asJsonString(l), rs = asJsonString(r);
         if (ls != null && rs != null) return JsonOps.jsonContainedBy(ls, rs);
@@ -796,15 +844,36 @@ public final class Evaluator {
         if (l == null || r == null) return null;
         if (l instanceof org.pgjava.types.PgRange lr && r instanceof org.pgjava.types.PgRange rr)
             return lr.overlaps(rr);
+        // Array && Array: any element of l is in r
+        if (l instanceof List<?> la && r instanceof List<?> ra) {
+            for (Object le : la) {
+                for (Object re : ra) { if (java.util.Objects.equals(le, re)) return Boolean.TRUE; }
+            }
+            return Boolean.FALSE;
+        }
+        return null;
+    }
+
+    private Object evalRangeAdjacent(Object l, Object r) {
+        if (l == null || r == null) return null;
+        if (l instanceof org.pgjava.types.PgRange lr && r instanceof org.pgjava.types.PgRange rr)
+            return lr.adjacent(rr);
         return null;
     }
 
     private Object sqlConcat(Object l, Object r) throws SQLException {
         // PostgreSQL: NULL || anything = NULL (strict operator)
         if (l == null || r == null) return null;
-        // JSONB || JSONB concatenation
-        String lj = asJsonString(l), rj = asJsonString(r);
-        if (lj != null && rj != null) return JsonOps.jsonConcat(lj, rj);
+        // JSONB || JSONB concatenation — only for object/array JSON values, not scalar strings.
+        // Without static type information we conservatively apply JSON concat only when both
+        // operands are JSON objects ({...}) or arrays ([...]).
+        if (l instanceof String ls && r instanceof String rs
+                && !ls.isEmpty() && !rs.isEmpty()
+                && (ls.charAt(0) == '{' || ls.charAt(0) == '[')
+                && (rs.charAt(0) == '{' || rs.charAt(0) == '[')) {
+            try { return JsonOps.jsonConcat(ls, rs); }
+            catch (Exception e) { /* fall through to string concat */ }
+        }
         // Array concatenation
         if (l instanceof List<?> la && r instanceof List<?> rb) {
             List<Object> result = new ArrayList<>(la);
@@ -888,6 +957,13 @@ public final class Evaluator {
         Object val = eval(ce.arg(), ctx);
         if (val == null) return null;
         String typName = ce.targetType().simpleName();
+        boolean isArrayCast = ce.targetType().arrayBounds() > 0;
+
+        // Array type cast: int[], text[], etc.
+        if (isArrayCast) {
+            return evalArrayCast(val, typName, ce, ctx);
+        }
+
         PgType target = types.byTypeName(typName);
         if (target == null && schemaTypeResolver != null) target = schemaTypeResolver.apply(typName);
         if (target == null)
@@ -921,6 +997,72 @@ public final class Evaluator {
             }
         }
         return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalArrayCast(Object val, String elemTypName, CastExpr ce, EvalContext ctx)
+            throws SQLException {
+        PgType elemType = types.byTypeName(elemTypName);
+        if (elemType == null && schemaTypeResolver != null) elemType = schemaTypeResolver.apply(elemTypName);
+
+        // If val is already a List, cast each element
+        if (val instanceof java.util.List<?> list) {
+            if (elemType == null) return list; // can't cast elements, return as-is
+            var out = new java.util.ArrayList<>(list.size());
+            for (Object elem : list) {
+                if (elem == null) { out.add(null); continue; }
+                if (elem instanceof String s) {
+                    out.add(TypeInput.parse(s, elemType.oid()));
+                } else {
+                    int srcOid = javaClassToOid(elem);
+                    out.add(CoercionEngine.coerce(elem, srcOid, elemType.oid(), CoercionContext.EXPLICIT));
+                }
+            }
+            return out;
+        }
+
+        // If val is a String, parse as PostgreSQL array literal {e1,e2,...}
+        if (val instanceof String s) {
+            String trimmed = s.strip();
+            if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+                String inner = trimmed.substring(1, trimmed.length() - 1).strip();
+                var out = new java.util.ArrayList<>();
+                if (!inner.isEmpty()) {
+                    for (String part : splitArrayLiteral(inner)) {
+                        String elem = part.strip();
+                        if ("NULL".equalsIgnoreCase(elem)) {
+                            out.add(null);
+                        } else {
+                            // Strip surrounding double quotes if present
+                            if (elem.startsWith("\"") && elem.endsWith("\""))
+                                elem = elem.substring(1, elem.length() - 1);
+                            out.add(elemType != null ? TypeInput.parse(elem, elemType.oid()) : elem);
+                        }
+                    }
+                }
+                return out;
+            }
+            // Not an array literal — try TypeInput on the raw string
+            if (elemType != null) return TypeInput.parse(s, elemType.oid());
+        }
+        return val;
+    }
+
+    /** Split a PostgreSQL array literal inner string on commas, respecting quotes. */
+    private static java.util.List<String> splitArrayLiteral(String s) {
+        var parts = new java.util.ArrayList<String>();
+        boolean inQuote = false;
+        int start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"') inQuote = !inQuote;
+            else if (c == ',' && !inQuote) {
+                parts.add(s.substring(start, i));
+                start = i + 1;
+            }
+        }
+        parts.add(s.substring(start));
+        return parts;
     }
 
     private int evalTypmod(Node mod, EvalContext ctx) throws SQLException {
@@ -973,6 +1115,19 @@ public final class Evaluator {
                 Object b = eval(fc.args().get(1), ctx);
                 if (a == null) return null;
                 return Boolean.TRUE.equals(sqlEquals(a, b)) ? null : a;
+            }
+            case "row_to_json" -> {
+                // row_to_json(t) where t is a table alias — resolve the composite row
+                if (fc.args().size() == 1 && fc.args().get(0) instanceof ColumnRef cr
+                        && cr.fields().size() == 1) {
+                    String tableAlias = cr.fields().get(0);
+                    Object[] rowData = ctx.resolveRowByAlias(tableAlias);
+                    if (rowData != null) {
+                        return org.pgjava.types.JsonOps.rowToJson(
+                                (Object[]) rowData[0], (String[]) rowData[1]);
+                    }
+                }
+                // Fall through to normal evaluation
             }
         }
 
@@ -1289,12 +1444,29 @@ public final class Evaluator {
     }
 
     // -------------------------------------------------------------------------
-    // Array subscript: arr[n] (1-based)
+    // Array subscript: arr[n] or arr[m:n] (1-based)
 
     private Object evalSubscript(SubscriptExpr se, EvalContext ctx) throws SQLException {
         Object target = eval(se.target(), ctx);
-        Object idx    = eval(se.idx(), ctx);
-        if (target == null || idx == null) return null;
+        if (target == null) return null;
+
+        if (se.isSlice()) {
+            // Slice: arr[lower:upper] — return sub-array (1-based, inclusive)
+            Object lo = se.idx()      != null ? eval(se.idx(),      ctx) : null;
+            Object hi = se.idxUpper() != null ? eval(se.idxUpper(), ctx) : null;
+            List<?> list = toList(target);
+            if (list == null)
+                throw PgErrorException.error("42804", "cannot subscript type that is not an array").build();
+            int size = list.size();
+            int lower = lo != null ? Math.max(1, toInt(lo)) : 1;
+            int upper = hi != null ? Math.min(size, toInt(hi)) : size;
+            if (lower > upper || lower > size) return new java.util.ArrayList<>();
+            return new java.util.ArrayList<>(list.subList(lower - 1, upper));
+        }
+
+        // Simple subscript: arr[n]
+        Object idx = eval(se.idx(), ctx);
+        if (idx == null) return null;
         int i = toInt(idx) - 1; // PG is 1-based
         if (target instanceof List<?> list) {
             if (i < 0 || i >= list.size()) return null;
@@ -1305,6 +1477,12 @@ public final class Evaluator {
             return arr[i];
         }
         throw PgErrorException.error("42804", "cannot subscript type that is not an array").build();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Object> toList(Object v) {
+        if (v instanceof List<?> l) return (List<Object>) l;
+        return null;
     }
 
     // -------------------------------------------------------------------------

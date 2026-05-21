@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.pganalyze.pg_query.PgQuery;
 import com.pganalyze.pg_query.PgQueryException;
 import org.pgjava.sql.ast.*;
+import org.pgjava.sql.ast.FrameBoundType;
 
 import java.util.*;
 
@@ -653,6 +654,7 @@ final class NativeParser {
             case "Integer"        -> new IntegerLiteral(c.path("ival").longValue());
             case "String"         -> new StringLiteral(c.path("sval").asText());
             case "Float"          -> new FloatLiteral(c.path("fval").asText());
+            case "Boolean"        -> new BooleanLiteral(c.path("boolval").booleanValue());
             default -> throw new UnsupportedOperationException("Unknown expr node: " + type);
         };
     }
@@ -1113,9 +1115,7 @@ final class NativeParser {
     private static WindowFrameClause convertFrameClause(JsonNode c) {
         int opts = c.path("frameOptions").asInt(0);
         if (opts == 0) return null;
-
-        // Suppress pg_query's default frame — WindowAgg already uses the same default.
-        // Default: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (0x422)
+        // Suppress pg_query's injected default frame — WindowAgg already handles this.
         if ((opts & FO_NONDEFAULT) == 0) return null;
 
         String mode;
@@ -1123,34 +1123,43 @@ final class NativeParser {
         else if ((opts & FO_GROUPS) != 0) mode = "GROUPS";
         else mode = "RANGE";
 
-        Expr startBound = convertFrameBound(c.path("startOffset"), opts, true);
-        Expr endBound = (opts & FO_BETWEEN) != 0 ? convertFrameBound(c.path("endOffset"), opts, false) : null;
+        FrameBoundType startType = extractStartType(opts);
+        Expr startOffset = needsOffsetExpr(startType)
+                ? convertExpr(c.path("startOffset")) : null;
 
-        if (startBound == null && endBound == null && mode.equals("RANGE")) return null;
-        return new WindowFrameClause(mode, startBound, endBound);
+        FrameBoundType endType;
+        Expr endOffset;
+        if ((opts & FO_BETWEEN) != 0) {
+            endType = extractEndType(opts);
+            endOffset = needsOffsetExpr(endType)
+                    ? convertExpr(c.path("endOffset")) : null;
+        } else {
+            endType   = FrameBoundType.CURRENT_ROW;
+            endOffset = null;
+        }
+
+        return new WindowFrameClause(mode, startType, startOffset, endType, endOffset);
     }
 
-    private static Expr convertFrameBound(JsonNode offsetNode, int opts, boolean isStart) {
-        if (isStart) {
-            if ((opts & FO_START_UNBOUNDED_PRECEDING) != 0) return new StringLiteral("UNBOUNDED PRECEDING");
-            if ((opts & FO_START_CURRENT_ROW) != 0) return new StringLiteral("CURRENT ROW");
-            if ((opts & FO_START_OFFSET_PRECEDING) != 0) {
-                return offsetNode != null && !offsetNode.isMissingNode() ? convertExpr(offsetNode) : new StringLiteral("0");
-            }
-            if ((opts & FO_START_OFFSET_FOLLOWING) != 0) {
-                return offsetNode != null && !offsetNode.isMissingNode() ? convertExpr(offsetNode) : new StringLiteral("0");
-            }
-        } else {
-            if ((opts & FO_END_UNBOUNDED_FOLLOWING) != 0) return new StringLiteral("UNBOUNDED FOLLOWING");
-            if ((opts & FO_END_CURRENT_ROW) != 0) return new StringLiteral("CURRENT ROW");
-            if ((opts & FO_END_OFFSET_PRECEDING) != 0) {
-                return offsetNode != null && !offsetNode.isMissingNode() ? convertExpr(offsetNode) : new StringLiteral("0");
-            }
-            if ((opts & FO_END_OFFSET_FOLLOWING) != 0) {
-                return offsetNode != null && !offsetNode.isMissingNode() ? convertExpr(offsetNode) : new StringLiteral("0");
-            }
-        }
-        return null;
+    private static FrameBoundType extractStartType(int opts) {
+        if ((opts & FO_START_UNBOUNDED_PRECEDING) != 0) return FrameBoundType.UNBOUNDED_PRECEDING;
+        if ((opts & FO_START_CURRENT_ROW) != 0)         return FrameBoundType.CURRENT_ROW;
+        if ((opts & FO_START_OFFSET_PRECEDING) != 0)    return FrameBoundType.N_PRECEDING;
+        if ((opts & FO_START_OFFSET_FOLLOWING) != 0)    return FrameBoundType.N_FOLLOWING;
+        // FO_START_UNBOUNDED_FOLLOWING is technically invalid for start bound
+        return FrameBoundType.UNBOUNDED_PRECEDING;
+    }
+
+    private static FrameBoundType extractEndType(int opts) {
+        if ((opts & FO_END_UNBOUNDED_FOLLOWING) != 0)   return FrameBoundType.UNBOUNDED_FOLLOWING;
+        if ((opts & FO_END_CURRENT_ROW) != 0)            return FrameBoundType.CURRENT_ROW;
+        if ((opts & FO_END_OFFSET_PRECEDING) != 0)       return FrameBoundType.N_PRECEDING;
+        if ((opts & FO_END_OFFSET_FOLLOWING) != 0)       return FrameBoundType.N_FOLLOWING;
+        return FrameBoundType.CURRENT_ROW;
+    }
+
+    private static boolean needsOffsetExpr(FrameBoundType type) {
+        return type == FrameBoundType.N_PRECEDING || type == FrameBoundType.N_FOLLOWING;
     }
 
     private static IndexElem convertIndexElem(JsonNode c) {
@@ -1223,6 +1232,10 @@ final class NativeParser {
             case "CONSTR_FOREIGN" -> ConstrType.FK;
             default -> ConstrType.CHECK;
         };
+        // For FK constraints, keys is empty and pk_attrs holds the referenced parent columns
+        if ("CONSTR_FOREIGN".equals(ct)) {
+            for (JsonNode a : c.path("pk_attrs")) keys.add(getString(a));
+        }
         RangeVar pktable = c.path("pktable").isMissingNode() ? null : convertRangeVar(c.path("pktable"));
         var fkAttrs = new ArrayList<String>();
         for (JsonNode a : c.path("fk_attrs")) fkAttrs.add(getString(a));

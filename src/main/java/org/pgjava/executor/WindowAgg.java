@@ -2,6 +2,7 @@ package org.pgjava.executor;
 
 import org.pgjava.engine.PgErrorException;
 import org.pgjava.sql.ast.*;
+import org.pgjava.sql.ast.FrameBoundType;
 import org.pgjava.storage.Row;
 import org.pgjava.storage.RowId;
 
@@ -300,18 +301,31 @@ public final class WindowAgg extends Operator {
     private void computeFirstLast(List<Integer> sorted, FunctionCall fc, List<Row> input,
                                    Object[] results, boolean isFirst) throws SQLException {
         int n = sorted.size();
-        if (n == 0) return;
-        if (fc.args().isEmpty()) return;
+        if (n == 0 || fc.args().isEmpty()) return;
 
-        // Note: frame clause parsing is not yet implemented (WindowDef.frame() is always null).
-        // Once frame parsing is available, LAST_VALUE with default frame (no explicit frame +
-        // ORDER BY present) should return current-row value, not partition-last.
-        // For now, use partition-first / partition-last for all cases.
-        Object val = isFirst
-                ? evalArg(fc, 0, input.get(sorted.get(0)))
-                : evalArg(fc, 0, input.get(sorted.get(n - 1)));
+        WindowDef over = fc.over();
+        boolean hasOrderBy = over != null && over.orderClause() != null && !over.orderClause().isEmpty();
+        WindowFrameClause frame = over != null ? over.frame() : null;
+
         for (int i = 0; i < n; i++) {
-            results[sorted.get(i)] = val;
+            int framePos;
+            if (frame != null) {
+                int[] bounds = computeFrameBounds(frame, i, n, sorted, input, over, hasOrderBy);
+                framePos = isFirst ? bounds[0] : bounds[1];
+            } else if (hasOrderBy) {
+                // Default: RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+                framePos = isFirst ? 0 : i;
+                // For LAST_VALUE default: end is last peer in current group
+                if (!isFirst) {
+                    while (framePos < n - 1 && sameOrderByValue(sorted.get(framePos + 1), sorted.get(i), over, input))
+                        framePos++;
+                }
+            } else {
+                // No ORDER BY: full partition
+                framePos = isFirst ? 0 : n - 1;
+            }
+            framePos = Math.max(0, Math.min(n - 1, framePos));
+            results[sorted.get(i)] = evalArg(fc, 0, input.get(sorted.get(framePos)));
         }
     }
 
@@ -319,23 +333,46 @@ public final class WindowAgg extends Operator {
                                   Object[] results) throws SQLException {
         int n = sorted.size();
         if (fc.args().size() < 2) return;
-        Object nv = evalArg(fc, 1, n > 0 ? input.get(sorted.get(0)) : null);
-        int nth = nv instanceof Number nb ? nb.intValue() : 1;
-        Object val = (nth >= 1 && nth <= n) ? evalArg(fc, 0, input.get(sorted.get(nth - 1))) : null;
-        for (int i = 0; i < n; i++) results[sorted.get(i)] = val;
+
+        WindowDef over = fc.over();
+        boolean hasOrderBy = over != null && over.orderClause() != null && !over.orderClause().isEmpty();
+        WindowFrameClause frame = over != null ? over.frame() : null;
+
+        for (int i = 0; i < n; i++) {
+            Object nv = evalArg(fc, 1, input.get(sorted.get(i)));
+            int nth = nv instanceof Number nb ? nb.intValue() : 1;
+
+            int frameStart;
+            if (frame != null) {
+                int[] bounds = computeFrameBounds(frame, i, n, sorted, input, over, hasOrderBy);
+                frameStart = bounds[0];
+                int frameEnd = bounds[1];
+                int framePos = frameStart + nth - 1;
+                if (framePos > frameEnd || framePos < 0 || framePos >= n) {
+                    results[sorted.get(i)] = null;
+                } else {
+                    results[sorted.get(i)] = evalArg(fc, 0, input.get(sorted.get(framePos)));
+                }
+            } else if (hasOrderBy) {
+                // Default frame: RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+                frameStart = 0;
+                int framePos = frameStart + nth - 1;
+                if (framePos > i || framePos < 0 || framePos >= n) {
+                    results[sorted.get(i)] = null;
+                } else {
+                    results[sorted.get(i)] = evalArg(fc, 0, input.get(sorted.get(framePos)));
+                }
+            } else {
+                // No ORDER BY: full partition
+                int framePos = nth - 1;
+                results[sorted.get(i)] = (nth >= 1 && nth <= n)
+                        ? evalArg(fc, 0, input.get(sorted.get(framePos))) : null;
+            }
+        }
     }
 
     // ── Aggregate window functions ────────────────────────────────────────────
 
-    /**
-     * Compute SUM/COUNT/MIN/MAX/AVG over a frame.
-     *
-     * <p>Default frame semantics (PostgreSQL):
-     * <ul>
-     *   <li>ORDER BY present: RANGE UNBOUNDED PRECEDING TO CURRENT ROW (running agg)</li>
-     *   <li>No ORDER BY:      full partition</li>
-     * </ul>
-     */
     private void computeFrameAgg(List<Integer> sorted, String func, WindowDef over,
                                   FunctionCall fc, List<Row> input, Object[] results)
             throws SQLException {
@@ -343,7 +380,7 @@ public final class WindowAgg extends Operator {
         if (n == 0) return;
 
         boolean hasOrderBy = over != null && over.orderClause() != null && !over.orderClause().isEmpty();
-        boolean hasFrame   = over != null && over.frame() != null;
+        WindowFrameClause frame = over != null ? over.frame() : null;
 
         // Evaluate the argument expression for each row in the partition
         Object[] argVals = new Object[n];
@@ -352,24 +389,99 @@ public final class WindowAgg extends Operator {
                     : (fc.args().isEmpty() ? null : evalArg(fc, 0, input.get(sorted.get(i))));
         }
 
-        if (!hasOrderBy && !hasFrame) {
-            // No ORDER BY, no frame: aggregate over entire partition
+        if (frame != null) {
+            // Explicit frame: compute per-row
+            for (int i = 0; i < n; i++) {
+                int[] bounds = computeFrameBounds(frame, i, n, sorted, input, over, hasOrderBy);
+                results[sorted.get(i)] = computeAgg(func, argVals, bounds[0], bounds[1], fc.aggDistinct());
+            }
+        } else if (!hasOrderBy) {
+            // No ORDER BY, no explicit frame: full partition
             Object agg = computeAgg(func, argVals, 0, n - 1, fc.aggDistinct());
             for (int i = 0; i < n; i++) results[sorted.get(i)] = agg;
         } else {
-            // ORDER BY present (or frame explicit): running aggregate ending at current row
-            // Handle RANGE ties: all rows with same ORDER BY value get the same running value
+            // ORDER BY, no explicit frame: default RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+            // Handle ties: all rows in same peer group get same running value
             for (int i = 0; i < n; ) {
-                // Find the end of the tie group
                 int j = i;
-                if (hasOrderBy) {
-                    while (j < n - 1 && sameOrderByValue(sorted.get(j), sorted.get(j + 1), over, input)) j++;
-                }
+                while (j < n - 1 && sameOrderByValue(sorted.get(j), sorted.get(j + 1), over, input)) j++;
                 Object agg = computeAgg(func, argVals, 0, j, fc.aggDistinct());
                 for (int k = i; k <= j; k++) results[sorted.get(k)] = agg;
                 i = j + 1;
             }
         }
+    }
+
+    /** Resolve ROWS/RANGE frame bounds for row at position i (0-based in sorted order). */
+    private int[] computeFrameBounds(WindowFrameClause frame, int i, int n,
+                                      List<Integer> sorted, List<Row> input,
+                                      WindowDef over, boolean hasOrderBy) throws SQLException {
+        int start, end;
+        if (frame.mode().equals("ROWS")) {
+            start = resolveRowsBound(frame.startType(), frame.startOffset(), i, n, sorted, input);
+            end   = resolveRowsBound(frame.endType(),   frame.endOffset(),   i, n, sorted, input);
+        } else {
+            // RANGE mode
+            start = resolveRangeBound(frame.startType(), frame.startOffset(), i, n, sorted, input, over, true);
+            end   = resolveRangeBound(frame.endType(),   frame.endOffset(),   i, n, sorted, input, over, false);
+        }
+        return new int[]{ Math.max(0, start), Math.min(n - 1, end) };
+    }
+
+    private int resolveRowsBound(FrameBoundType type, Expr offsetExpr, int i, int n,
+                                  List<Integer> sorted, List<Row> input) throws SQLException {
+        return switch (type) {
+            case UNBOUNDED_PRECEDING -> 0;
+            case N_PRECEDING -> {
+                int off = evalIntOffset(offsetExpr, sorted, input, i);
+                yield i - off;
+            }
+            case CURRENT_ROW -> i;
+            case N_FOLLOWING -> {
+                int off = evalIntOffset(offsetExpr, sorted, input, i);
+                yield i + off;
+            }
+            case UNBOUNDED_FOLLOWING -> n - 1;
+        };
+    }
+
+    private int resolveRangeBound(FrameBoundType type, Expr offsetExpr, int i, int n,
+                                   List<Integer> sorted, List<Row> input,
+                                   WindowDef over, boolean isStart) throws SQLException {
+        return switch (type) {
+            case UNBOUNDED_PRECEDING -> 0;
+            case UNBOUNDED_FOLLOWING -> n - 1;
+            case CURRENT_ROW -> {
+                // In RANGE mode, CURRENT ROW means the peer group of the current row
+                if (isStart) {
+                    // Find first row in current peer group
+                    int pos = i;
+                    while (pos > 0 && sameOrderByValue(sorted.get(pos - 1), sorted.get(i), over, input)) pos--;
+                    yield pos;
+                } else {
+                    // Find last row in current peer group
+                    int pos = i;
+                    while (pos < n - 1 && sameOrderByValue(sorted.get(pos + 1), sorted.get(i), over, input)) pos++;
+                    yield pos;
+                }
+            }
+            case N_PRECEDING, N_FOLLOWING -> {
+                // For value-based RANGE offsets, we need numeric ORDER BY
+                // This is complex; fall back to ROWS semantics for now
+                int off = evalIntOffset(offsetExpr, sorted, input, i);
+                yield type == FrameBoundType.N_PRECEDING ? i - off : i + off;
+            }
+        };
+    }
+
+    private int evalIntOffset(Expr expr, List<Integer> sorted, List<Row> input, int i)
+            throws SQLException {
+        if (expr == null) return 0;
+        Row row = sorted.isEmpty() ? null : input.get(sorted.get(i));
+        EvalContext ctx = row != null ? source.schema().buildContext(row) : EvalContext.empty();
+        Object v = eval.eval(expr, ctx);
+        if (v instanceof Number n) return n.intValue();
+        try { return Integer.parseInt(v.toString()); } catch (NumberFormatException e) { return 0; }
     }
 
     private Object computeAgg(String func, Object[] vals, int from, int to, boolean distinct)

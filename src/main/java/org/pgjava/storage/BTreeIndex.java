@@ -43,17 +43,17 @@ public final class BTreeIndex {
     /**
      * Insert a key → RowId mapping.
      *
-     * @throws SQLException SQLSTATE 23505 if the index is UNIQUE and the key
-     *                      already has a live RowId.
+     * <p>Uniqueness is enforced by {@link org.pgjava.storage.ConstraintChecker#checkUnique}
+     * before this method is called (under the table's constraintLock).  This method appends
+     * unconditionally so that WAL undo/rollback paths can re-insert entries without spurious
+     * 23505 errors from uncommitted or tombstoned rows left in the index by other transactions.
+     *
+     * @throws SQLException declared for API compatibility; never thrown by this method
      */
     public void insert(Object[] keyValues, RowId rowId) throws SQLException {
         IndexKey key = new IndexKey(keyValues);
         List<RowId> ids = tree.computeIfAbsent(key, k -> Collections.synchronizedList(new ArrayList<>()));
         synchronized (ids) {
-            if (def.unique() && !ids.isEmpty()) {
-                throw PgErrorException.error("23505",
-                        "duplicate key value violates unique constraint \"" + def.name() + "\"").build();
-            }
             ids.add(rowId);
         }
     }

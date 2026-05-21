@@ -152,7 +152,8 @@ public final class CopyExecutor {
             ConstraintChecker.checkCheck(def, targetVals, planner.evaluator());
             ConstraintChecker.checkDomainAndEnum(def, targetVals, planner.evaluator());
             ConstraintChecker.checkForeignKey(def, targetVals, storage,
-                    name -> catalog.resolveTable(name, searchPath));
+                    name -> catalog.resolveTable(name, searchPath),
+                    txMgr.snapshotFor(tx.txid()));
             try {
                 txMgr.insert(tx, def.oid(), targetVals,
                         TransactionManager.columnNameExtractor(storage.table(def.oid())));

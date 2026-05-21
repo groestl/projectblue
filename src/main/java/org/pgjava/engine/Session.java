@@ -96,6 +96,7 @@ public final class Session implements AutoCloseable, NotificationBus.Listener {
         this.ddl = new DdlExecutor(database);
         // Wire evaluator into DDL executor so ADD COLUMN DEFAULT can fill existing rows
         Evaluator ddlEval = new Evaluator(database.catalog().functions(), database.collation());
+        ddlEval.setTypeRegistry(database.typeRegistry());
         this.ddl.setEvaluator(ddlEval);
         this.database = database;
         registerSessionFunctions();
@@ -325,7 +326,9 @@ public final class Session implements AutoCloseable, NotificationBus.Listener {
         }
 
         // DDL — delegate to DdlExecutor
+        // Wire active transaction so DDL can register catalog undo actions.
         List<String> sp = searchPath();
+        ddl.setCurrentTransaction(activeTx);
         if (stmt instanceof CreateTableStmt s) {
             ddl.executeCreateTable(s, sp);
             return QueryResult.EMPTY_DML;
@@ -589,21 +592,87 @@ public final class Session implements AutoCloseable, NotificationBus.Listener {
         root.open();
         try {
             OutputSchema schema = root.schema();
-            List<ColumnMeta> cols = new ArrayList<>(schema.width());
-            for (int i = 0; i < schema.width(); i++) {
-                cols.add(ColumnMeta.varchar(schema.name(i)));
-            }
+            int width = schema.width();
+            int[] oids = new int[width];
+            java.util.Arrays.fill(oids, org.pgjava.types.PgOid.TEXT);  // default
             List<Object[]> rows = new ArrayList<>();
             Row r;
             while ((r = root.next()) != null) {
                 Object[] vals = r.values().clone();
                 normalizeOutputValues(vals);
+                // Infer column OIDs from first non-null value in each column
+                for (int i = 0; i < width; i++) {
+                    if (oids[i] == org.pgjava.types.PgOid.TEXT && vals[i] != null) {
+                        int inferred = inferOidFromValue(vals[i]);
+                        if (inferred != org.pgjava.types.PgOid.TEXT) oids[i] = inferred;
+                    }
+                }
                 rows.add(vals);
+            }
+            List<ColumnMeta> cols = new ArrayList<>(width);
+            for (int i = 0; i < width; i++) {
+                cols.add(ColumnMeta.ofOid(schema.name(i), oids[i]));
             }
             return new QueryResult(-1, cols, rows);
         } finally {
             root.close();
         }
+    }
+
+    /** Infer PostgreSQL type OID from a Java value's runtime type. */
+    private static int inferOidFromValue(Object v) {
+        if (v instanceof Long)                          return org.pgjava.types.PgOid.INT8;
+        if (v instanceof Integer)                       return org.pgjava.types.PgOid.INT4;
+        if (v instanceof Short)                         return org.pgjava.types.PgOid.INT2;
+        if (v instanceof Double)                        return org.pgjava.types.PgOid.FLOAT8;
+        if (v instanceof Float)                         return org.pgjava.types.PgOid.FLOAT4;
+        if (v instanceof java.math.BigDecimal)          return org.pgjava.types.PgOid.NUMERIC;
+        if (v instanceof Boolean)                       return org.pgjava.types.PgOid.BOOL;
+        if (v instanceof byte[])                        return org.pgjava.types.PgOid.BYTEA;
+        if (v instanceof java.time.LocalDate)           return org.pgjava.types.PgOid.DATE;
+        if (v instanceof java.time.LocalTime)           return org.pgjava.types.PgOid.TIME;
+        if (v instanceof java.time.OffsetTime)          return org.pgjava.types.PgOid.TIMETZ;
+        if (v instanceof java.time.LocalDateTime)       return org.pgjava.types.PgOid.TIMESTAMP;
+        if (v instanceof java.time.OffsetDateTime)      return org.pgjava.types.PgOid.TIMESTAMPTZ;
+        if (v instanceof java.util.UUID)                return org.pgjava.types.PgOid.UUID;
+        if (v instanceof org.pgjava.types.PgInterval)  return org.pgjava.types.PgOid.INTERVAL;
+        if (v instanceof org.pgjava.types.PgRange)     return inferRangeOid((org.pgjava.types.PgRange) v);
+        if (v instanceof java.util.List<?> list)        return inferArrayOid(list);
+        // String: stays as TEXT (most common)
+        return org.pgjava.types.PgOid.TEXT;
+    }
+
+    private static int inferRangeOid(org.pgjava.types.PgRange r) {
+        Object bound = r.lower() != null ? r.lower() : r.upper();
+        if (bound instanceof Integer || bound instanceof Long) {
+            return (bound instanceof Long) ? org.pgjava.types.PgOid.INT8RANGE
+                                           : org.pgjava.types.PgOid.INT4RANGE;
+        }
+        if (bound instanceof java.math.BigDecimal) return org.pgjava.types.PgOid.NUMRANGE;
+        if (bound instanceof java.time.LocalDate)  return org.pgjava.types.PgOid.DATERANGE;
+        if (bound instanceof java.time.LocalDateTime)  return org.pgjava.types.PgOid.TSRANGE;
+        if (bound instanceof java.time.OffsetDateTime) return org.pgjava.types.PgOid.TSTZRANGE;
+        return org.pgjava.types.PgOid.TEXT;
+    }
+
+    private static int inferArrayOid(java.util.List<?> list) {
+        for (Object elem : list) {
+            if (elem == null) continue;
+            return switch (inferOidFromValue(elem)) {
+                case org.pgjava.types.PgOid.INT4 -> org.pgjava.types.PgOid.INT4_ARRAY;
+                case org.pgjava.types.PgOid.INT8 -> org.pgjava.types.PgOid.INT8_ARRAY;
+                case org.pgjava.types.PgOid.INT2 -> org.pgjava.types.PgOid.INT2_ARRAY;
+                case org.pgjava.types.PgOid.FLOAT4 -> org.pgjava.types.PgOid.FLOAT4_ARRAY;
+                case org.pgjava.types.PgOid.FLOAT8 -> org.pgjava.types.PgOid.FLOAT8_ARRAY;
+                case org.pgjava.types.PgOid.NUMERIC -> org.pgjava.types.PgOid.NUMERIC_ARRAY;
+                case org.pgjava.types.PgOid.BOOL -> org.pgjava.types.PgOid.BOOL_ARRAY;
+                case org.pgjava.types.PgOid.DATE -> org.pgjava.types.PgOid.DATE_ARRAY;
+                case org.pgjava.types.PgOid.TIMESTAMP -> org.pgjava.types.PgOid.TIMESTAMP_ARRAY;
+                case org.pgjava.types.PgOid.TIMESTAMPTZ -> org.pgjava.types.PgOid.TIMESTAMPTZ_ARRAY;
+                default -> org.pgjava.types.PgOid.TEXT_ARRAY;
+            };
+        }
+        return org.pgjava.types.PgOid.TEXT_ARRAY;
     }
 
     // -------------------------------------------------------------------------
@@ -936,6 +1005,7 @@ public final class Session implements AutoCloseable, NotificationBus.Listener {
 
     private Planner makePlanner() {
         Evaluator eval = new Evaluator(database.catalog().functions(), database.collation());
+        eval.setTypeRegistry(database.typeRegistry());
         eval.setSessionFunctions(sessionFunctions);
         if (execParams != null) eval.setFunctionParams(execParams);
         // Wire schema-local type resolution for user-defined enums/domains

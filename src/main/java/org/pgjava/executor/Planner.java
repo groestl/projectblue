@@ -288,18 +288,27 @@ public final class Planner {
             }
         }
 
+        // ── SRF-in-SELECT: promote SRF function calls in target list to FROM ───
+        // e.g. SELECT unnest(arr) → treat as SELECT u FROM unnest(arr) AS u
+        List<TargetEntry> effectiveSrfTargets = s.targetList(); // may be rewritten below
+        {
+            SrfLiftResult liftResult = liftSrfTargets(s.targetList(), current, s.fromClause().isEmpty());
+            current = liftResult.op();
+            effectiveSrfTargets = liftResult.rewrittenTargets();
+        }
+
         // ── WHERE ─────────────────────────────────────────────────────────────
         if (s.whereClause() != null) {
             current = new Filter(current, s.whereClause(), eval);
         }
 
         // ── Detect aggregates in target list / HAVING ────────────────────────
-        List<FunctionCall> aggCalls = collectAggregates(s.targetList(), s.having());
+        List<FunctionCall> aggCalls = collectAggregates(effectiveSrfTargets, s.having(), s.orderBy());
         boolean hasAgg = !aggCalls.isEmpty() || !s.groupBy().isEmpty();
 
         if (hasAgg) {
             List<AggAccumulator> accTemplates = new ArrayList<>();
-            for (FunctionCall fc : aggCalls) accTemplates.add(new AggAccumulator(fc, eval));
+            for (FunctionCall fc : aggCalls) accTemplates.add(new AggAccumulator(fc, eval, catalog.functions()));
             current = new HashAgg(current, s.groupBy(), accTemplates, eval);
             // HAVING: rewrite agg and group-key refs before filtering
             if (s.having() != null) {
@@ -310,11 +319,11 @@ public final class Planner {
         }
 
         // ── Window functions ──────────────────────────────────────────────────
-        WinFuncCollection winCol = collectWindowFuncs(s.targetList(), s.windows());
-        List<TargetEntry> effectiveTargets = s.targetList();
+        WinFuncCollection winCol = collectWindowFuncs(effectiveSrfTargets, s.windows());
+        List<TargetEntry> effectiveTargets = effectiveSrfTargets;
         if (!winCol.funcs().isEmpty()) {
             current = new WindowAgg(current, winCol.funcs(), eval);
-            effectiveTargets = rewriteTargetsForWindow(s.targetList(), winCol.keyToOut());
+            effectiveTargets = rewriteTargetsForWindow(effectiveSrfTargets, winCol.keyToOut());
         }
 
         // ── ORDER BY / DISTINCT ON sort ───────────────────────────────────────
@@ -512,12 +521,111 @@ public final class Planner {
 
         // Determine table alias and column names
         String tableAlias = rf.alias() != null ? rf.alias().toLowerCase() : fnName;
-        List<String> colNames = rf.colAliases().isEmpty()
-                ? srf.outColumnNames()
-                : rf.colAliases();
+        List<String> srfCols = srf.outColumnNames();
+        List<String> colNames;
+        if (!rf.colAliases().isEmpty()) {
+            // Caller provided explicit names — WITH ORDINALITY may add one extra
+            colNames = rf.withOrdinality()
+                    ? rf.colAliases().subList(0, Math.min(rf.colAliases().size(), srfCols.size()))
+                    : rf.colAliases();
+        } else {
+            colNames = srfCols;
+        }
+
+        // WITH ORDINALITY: wrap the SRF to add a sequential ordinal (bigint) column
+        if (rf.withOrdinality()) {
+            String ordColName = !rf.colAliases().isEmpty() && rf.colAliases().size() > srfCols.size()
+                    ? rf.colAliases().get(srfCols.size())
+                    : "ordinality";
+            List<String> allCols = new java.util.ArrayList<>(colNames);
+            allCols.add(ordColName);
+            final List<String> finalAllCols = List.copyOf(allCols);
+            final var innerSrf = srf;
+
+            // Create a wrapper SRF that adds ordinality
+            var ordSrf = new org.pgjava.catalog.SrfDef(
+                    innerSrf.oid(), innerSrf.name(), innerSrf.schemaName(),
+                    innerSrf.argTypes(), finalAllCols, innerSrf.variadic(),
+                    args -> {
+                        Iterable<Object[]> inner = innerSrf.impl().invoke(args);
+                        List<Object[]> out = new java.util.ArrayList<>();
+                        long ord = 1L;
+                        for (Object[] row : inner) {
+                            Object[] extended = new Object[row.length + 1];
+                            System.arraycopy(row, 0, extended, 0, row.length);
+                            extended[row.length] = ord++;
+                            out.add(extended);
+                        }
+                        return out;
+                    });
+            OutputSchema schema = OutputSchema.ofNamesWithAlias(tableAlias, finalAllCols);
+            return new FunctionScanOperator(ordSrf, rf.function().args(), eval, schema);
+        }
 
         OutputSchema schema = OutputSchema.ofNamesWithAlias(tableAlias, colNames);
         return new FunctionScanOperator(srf, rf.function().args(), eval, schema);
+    }
+
+    /** Result of lifting SRF calls from the target list into the FROM clause. */
+    private record SrfLiftResult(Operator op, List<TargetEntry> rewrittenTargets) {}
+
+    /**
+     * Detect SRF function calls in the SELECT target list and promote them to
+     * implicit FROM entries.  For example, {@code SELECT unnest(arr)} becomes
+     * {@code SELECT unnest FROM unnest(arr)}.
+     *
+     * @param targets        original SELECT target list
+     * @param current        current operator (from clause or synthetic empty row)
+     * @param fromWasEmpty   true when no explicit FROM clause existed
+     */
+    private SrfLiftResult liftSrfTargets(List<TargetEntry> targets, Operator current,
+                                          boolean fromWasEmpty) throws SQLException {
+        // Check whether any target contains an SRF function call
+        boolean hasSrf = false;
+        for (TargetEntry te : targets) {
+            if (isSrfCall(te.val())) { hasSrf = true; break; }
+        }
+        if (!hasSrf) return new SrfLiftResult(current, targets);
+
+        // Promote each SRF call to its own FunctionScanOperator
+        List<TargetEntry> rewritten = new ArrayList<>(targets.size());
+        boolean replacedEmpty = false;
+
+        for (TargetEntry te : targets) {
+            if (!isSrfCall(te.val())) { rewritten.add(te); continue; }
+
+            FunctionCall fc = (FunctionCall) te.val();
+            String fnName = fc.funcname().getLast().toLowerCase();
+            var srf = eval.findSrf(fnName, fc.args().size());
+            if (srf == null) { rewritten.add(te); continue; }
+
+            // Build a FunctionScanOperator for this SRF
+            String alias = te.name() != null ? te.name() : fnName;
+            List<String> colNames = srf.outColumnNames();
+            OutputSchema schema = OutputSchema.ofNamesWithAlias(alias, colNames);
+            Operator srfOp = new FunctionScanOperator(srf, fc.args(), eval, schema);
+
+            // Replace the SRF call in the target list with a ColumnRef to its first output column
+            String outCol = colNames.get(0);
+            Expr colRef = ColumnRef.of(alias, outCol);
+            rewritten.add(new TargetEntry(colRef, te.name() != null ? te.name() : outCol));
+
+            // Cross-join with current (replace synthetic empty row on first SRF)
+            if (fromWasEmpty && !replacedEmpty) {
+                current = srfOp;
+                replacedEmpty = true;
+            } else {
+                current = new NestedLoopJoin(current, srfOp, null, JoinType.CROSS, eval);
+            }
+        }
+        return new SrfLiftResult(current, rewritten);
+    }
+
+    /** Returns true if expr is a function call matching a registered SRF. */
+    private boolean isSrfCall(Node expr) {
+        if (!(expr instanceof FunctionCall fc)) return false;
+        String fnName = fc.funcname().getLast().toLowerCase();
+        return eval.findSrf(fnName, fc.args().size()) != null;
     }
 
     private Operator planJoin(JoinExpr je, Map<String, SelectStmt> cteMap)
@@ -539,6 +647,38 @@ public final class Planner {
         // USING → synthesize equality condition
         if (je.usingCols() != null && !je.usingCols().isEmpty()) {
             condition = buildUsingCondition(je.usingCols(), left.schema(), right.schema());
+        }
+
+        // NATURAL JOIN → auto-detect common columns, then project away right-side duplicates
+        if (je.natural()) {
+            List<String> commonCols = new ArrayList<>();
+            for (int i = 0; i < left.schema().width(); i++) {
+                String lName = left.schema().name(i);
+                for (int j = 0; j < right.schema().width(); j++) {
+                    if (lName.equalsIgnoreCase(right.schema().name(j))) {
+                        commonCols.add(lName);
+                        break;
+                    }
+                }
+            }
+            if (!commonCols.isEmpty()) {
+                condition = buildUsingCondition(commonCols, left.schema(), right.schema());
+            }
+            Operator joined = new NestedLoopJoin(left, right, condition, je.joinType(), eval);
+            // Remove duplicate right-side columns from output
+            Set<String> commonSet = new HashSet<>();
+            commonCols.forEach(c -> commonSet.add(c.toLowerCase()));
+            int leftWidth = left.schema().width();
+            OutputSchema js = joined.schema();
+            List<Project.Projection> projList = new ArrayList<>();
+            for (int i = 0; i < js.width(); i++) {
+                if (i >= leftWidth && commonSet.contains(js.name(i).toLowerCase())) continue;
+                String alias = js.alias(i);
+                String name  = js.name(i);
+                Expr ref = alias != null ? ColumnRef.of(alias, name) : ColumnRef.of(name);
+                projList.add(new Project.Projection(ref, name));
+            }
+            return new Project(joined, projList, eval);
         }
 
         return new NestedLoopJoin(left, right, condition, je.joinType(), eval);
@@ -772,12 +912,18 @@ public final class Planner {
         };
     }
 
-    private List<FunctionCall> collectAggregates(List<TargetEntry> targets, Expr having) {
+    private List<FunctionCall> collectAggregates(List<TargetEntry> targets, Expr having,
+                                                  List<SortKey> orderBy) {
         List<FunctionCall> aggs = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
         for (TargetEntry te : targets) collectAggs(te.val(), aggs, seen);
         if (having != null) collectAggs(having, aggs, seen);
+        if (orderBy != null) for (SortKey sk : orderBy) collectAggs(sk.node(), aggs, seen);
         return aggs;
+    }
+
+    private List<FunctionCall> collectAggregates(List<TargetEntry> targets, Expr having) {
+        return collectAggregates(targets, having, null);
     }
 
     private void collectAggs(Expr e, List<FunctionCall> out, Set<String> seen) {
@@ -806,14 +952,13 @@ public final class Planner {
         }
     }
 
-    private static final Set<String> AGG_NAMES = Set.of(
-            "count", "sum", "avg", "min", "max",
-            "bool_and", "bool_or", "every", "string_agg", "array_agg");
-
     private boolean isAggFunc(List<String> funcname) {
         if (funcname.isEmpty()) return false;
         String last = funcname.getLast().toLowerCase();
-        return AGG_NAMES.contains(last);
+        // Check built-in aggregate names first
+        if (AggAccumulator.BUILTIN_AGG_NAMES.contains(last)) return true;
+        // Also recognize user-defined aggregates registered in the catalog
+        return catalog.functions().findAggregate(last) != null;
     }
 
     // ── Projection builder ────────────────────────────────────────────────────
@@ -978,7 +1123,18 @@ public final class Planner {
             return fc.funcname().getLast().toLowerCase();
         }
         if (e instanceof CastExpr ce) {
-            return deriveColumnName(ce.arg());
+            // If the arg has an inherent name (column ref, function), use it; otherwise use type name
+            String argName = deriveColumnName(ce.arg());
+            if (!"?column?".equals(argName)) return argName;
+            return ce.targetType().simpleName();
+        }
+        // PostgreSQL names ARRAY[...] columns "array"
+        if (e instanceof org.pgjava.sql.ast.ArrayExpr) {
+            return "array";
+        }
+        // Subscript (array[n]) also named "array" by PostgreSQL
+        if (e instanceof org.pgjava.sql.ast.SubscriptExpr) {
+            return "array";
         }
         return "?column?";
     }
@@ -1376,6 +1532,9 @@ public final class Planner {
             source = new ValuesScan(List.of(), List.<Object[]>of(new Object[0]));
         }
 
+        // Derive column names from the view's SELECT target list for NEW.col resolution
+        String[] viewColNames = deriveViewColumnNames(view);
+
         source.open();
         int rowCount = 0;
         Row srcRow;
@@ -1384,12 +1543,35 @@ public final class Planner {
             boolean fired = TriggerExecutor.fireInsteadOf(
                     view.triggers(), TriggerDef.INSERT,
                     newVals, null,
-                    view.name(), view.schemaName(), null,
+                    view.name(), view.schemaName(), null, viewColNames,
                     triggerDatabase, searchPath);
             if (fired) rowCount++;
         }
         source.close();
         return DmlResult.ofCount(rowCount);
+    }
+
+    /** Derive column names from a view's SELECT target list. */
+    private static String[] deriveViewColumnNames(ViewDef view) {
+        if (!view.columnAliases().isEmpty()) {
+            return view.columnAliases().toArray(new String[0]);
+        }
+        SelectStmt sel = view.parsedDef();
+        if (sel == null || sel.targetList() == null || sel.targetList().isEmpty()) {
+            return null;
+        }
+        String[] names = new String[sel.targetList().size()];
+        for (int i = 0; i < sel.targetList().size(); i++) {
+            TargetEntry te = sel.targetList().get(i);
+            if (te.name() != null) {
+                names[i] = te.name();
+            } else if (te.val() instanceof ColumnRef cr && !cr.fields().isEmpty()) {
+                names[i] = cr.fields().getLast();
+            } else {
+                names[i] = "?column?";
+            }
+        }
+        return names;
     }
 
     /**

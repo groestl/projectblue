@@ -254,11 +254,11 @@ public final class InsertOp extends Operator {
 
             // Normal constraint checks + insert
             ConstraintChecker.checkNotNull(def, targetVals);
-            ConstraintChecker.checkUnique(def, targetVals, indexes, null);
+            ConstraintChecker.checkUnique(def, targetVals, indexes, null, heap, txSnapshot);
             ConstraintChecker.checkCheck(def, targetVals, eval);
             ConstraintChecker.checkDomainAndEnum(def, targetVals, eval);
             if (tableResolver != null) {
-                ConstraintChecker.checkForeignKey(def, targetVals, storage, tableResolver);
+                ConstraintChecker.checkForeignKey(def, targetVals, storage, tableResolver, txSnapshot);
             }
 
             // Insert via TransactionManager (WAL before heap)
@@ -364,11 +364,11 @@ public final class InsertOp extends Operator {
         }
 
         ConstraintChecker.checkNotNull(def, newVals);
-        ConstraintChecker.checkUnique(def, newVals, indexes, existingRow.rowId());
+        ConstraintChecker.checkUnique(def, newVals, indexes, existingRow.rowId(), heap, txSnapshot);
         ConstraintChecker.checkCheck(def, newVals, eval);
         ConstraintChecker.checkDomainAndEnum(def, newVals, eval);
         if (tableResolver != null) {
-            ConstraintChecker.checkForeignKey(def, newVals, storage, tableResolver);
+            ConstraintChecker.checkForeignKey(def, newVals, storage, tableResolver, txSnapshot);
         }
 
         try {

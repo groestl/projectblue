@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.*;
 import org.pgjava.engine.PgErrorException;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
@@ -119,12 +120,60 @@ public final class JsonOps {
         return toText(node);
     }
 
+    /**
+     * Convert a path argument to a List of path segments.
+     * Handles: List<?> as-is, Object[] arrays, and PostgreSQL array literal strings like "{a,b,c}".
+     */
+    private static List<String> toPathList(Object pathArray) {
+        if (pathArray instanceof List<?> l) {
+            List<String> result = new ArrayList<>(l.size());
+            for (Object o : l) result.add(o == null ? null : o.toString());
+            return result;
+        }
+        if (pathArray instanceof Object[] a) {
+            List<String> result = new ArrayList<>(a.length);
+            for (Object o : a) result.add(o == null ? null : o.toString());
+            return result;
+        }
+        String s = pathArray.toString().trim();
+        if (s.startsWith("{") && s.endsWith("}")) {
+            // Parse PostgreSQL array literal: {a,b,c} or {"a b","c"}
+            String inner = s.substring(1, s.length() - 1);
+            if (inner.isEmpty()) return new ArrayList<>();
+            List<String> result = new ArrayList<>();
+            int i = 0;
+            while (i < inner.length()) {
+                if (inner.charAt(i) == '"') {
+                    // Quoted element
+                    int j = i + 1;
+                    StringBuilder elem = new StringBuilder();
+                    while (j < inner.length() && inner.charAt(j) != '"') {
+                        if (inner.charAt(j) == '\\') j++; // skip escape
+                        elem.append(inner.charAt(j++));
+                    }
+                    result.add(elem.toString());
+                    j++; // skip closing quote
+                    if (j < inner.length() && inner.charAt(j) == ',') j++;
+                    i = j;
+                } else {
+                    // Unquoted element
+                    int j = inner.indexOf(',', i);
+                    if (j < 0) j = inner.length();
+                    result.add(inner.substring(i, j));
+                    i = j + 1;
+                }
+            }
+            return result;
+        }
+        // Single segment
+        return List.of(s);
+    }
+
     private static JsonNode navigatePath(String json, Object pathArray) throws SQLException {
         JsonNode current = parse(json);
-        List<?> path = (pathArray instanceof List<?> list) ? list : List.of(pathArray.toString());
-        for (Object segment : path) {
+        List<String> path = toPathList(pathArray);
+        for (String seg : path) {
             if (current == null || current.isMissingNode() || current.isNull()) return null;
-            String seg = segment.toString();
             if (current.isArray()) {
                 try {
                     int idx = Integer.parseInt(seg);
@@ -308,6 +357,40 @@ public final class JsonOps {
         return json;
     }
 
+    /**
+     * {@code jsonb #- text[]} — delete the value at the specified path.
+     */
+    public static String jsonDeletePath(String json, Object pathArray) throws SQLException {
+        if (json == null || pathArray == null) return null;
+        List<String> path = toPathList(pathArray);
+        if (path.isEmpty()) return json;
+        JsonNode root = parse(json).deepCopy();
+        if (path.size() == 1) {
+            String key = path.get(0);
+            if (root.isObject()) { ((ObjectNode) root).remove(key); }
+            else if (root.isArray()) {
+                try { ((ArrayNode) root).remove(Integer.parseInt(key)); }
+                catch (NumberFormatException ignored) {}
+            }
+            return root.toString();
+        }
+        // Navigate to parent
+        JsonNode current = root;
+        for (int i = 0; i < path.size() - 1; i++) {
+            String seg = path.get(i);
+            JsonNode next = navigateOne(current, seg);
+            if (next == null || next.isMissingNode()) return json; // path not found
+            current = next;
+        }
+        String last = path.get(path.size() - 1);
+        if (current.isObject()) { ((ObjectNode) current).remove(last); }
+        else if (current.isArray()) {
+            try { ((ArrayNode) current).remove(Integer.parseInt(last)); }
+            catch (NumberFormatException ignored) {}
+        }
+        return root.toString();
+    }
+
     // -------------------------------------------------------------------------
     // Functions
 
@@ -354,7 +437,7 @@ public final class JsonOps {
         if (target == null || pathArray == null || newValue == null) return null;
         JsonNode root = parse(target);
         JsonNode replacement = parse(newValue);
-        List<?> path = (pathArray instanceof List<?> l) ? l : List.of(pathArray.toString());
+        List<String> path = toPathList(pathArray);
         if (path.isEmpty()) return toJson(replacement);
 
         // Navigate to parent, set at last key
@@ -363,7 +446,7 @@ public final class JsonOps {
         root = root.deepCopy();
         current = root;
         for (int i = 0; i < path.size() - 1; i++) {
-            String seg = path.get(i).toString();
+            String seg = path.get(i);
             JsonNode next = navigateOne(current, seg);
             if (next == null || next.isMissingNode()) {
                 if (!createIfMissing) return toJson(root);
@@ -381,7 +464,7 @@ public final class JsonOps {
                 current = next;
             }
         }
-        String lastKey = path.get(path.size() - 1).toString();
+        String lastKey = path.get(path.size() - 1);
         if (current.isObject()) {
             if (!createIfMissing && !current.has(lastKey)) return toJson(root);
             ((ObjectNode) current).set(lastKey, replacement);
@@ -437,6 +520,11 @@ public final class JsonOps {
     }
 
     /** json_build_array(v1, v2, ...) */
+    /** Build a JSON array from a List of Java values. Used by json_agg / jsonb_agg. */
+    public static String toJsonArray(java.util.List<Object> elems) {
+        return jsonBuildArray(elems.toArray());
+    }
+
     public static String jsonBuildArray(Object[] args) {
         ArrayNode arr = MAPPER.createArrayNode();
         for (Object val : args) {
@@ -462,6 +550,62 @@ public final class JsonOps {
         }
         if (val instanceof Boolean || val instanceof Number) return val.toString();
         return "\"" + val.toString().replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    /** Build a JSON object from a LinkedHashMap (for json_object_agg). */
+    public static String jsonObjectFromMap(java.util.Map<String, Object> map) {
+        ObjectNode obj = MAPPER.createObjectNode();
+        for (var entry : map.entrySet()) {
+            String key = entry.getKey();
+            Object val = entry.getValue();
+            if (key == null) continue;
+            if (val == null) obj.putNull(key);
+            else if (val instanceof Boolean b) obj.put(key, b);
+            else if (val instanceof Integer n) obj.put(key, n);
+            else if (val instanceof Long n) obj.put(key, n);
+            else if (val instanceof Double n) obj.put(key, n);
+            else if (val instanceof java.math.BigDecimal n) obj.put(key, n);
+            else obj.put(key, val.toString());
+        }
+        return obj.toString();
+    }
+
+    /**
+     * json_object(keys, values) — build a JSON object from two arrays of keys/values.
+     * Both args may be a List, Object[], or a PG array literal string like '{a,b,c}'.
+     */
+    public static String jsonObjectFromArrays(Object keysArg, Object valsArg) throws SQLException {
+        List<String> keys = toStringList(keysArg);
+        List<String> vals = toStringList(valsArg);
+        ObjectNode obj = MAPPER.createObjectNode();
+        for (int i = 0; i < keys.size(); i++) {
+            String key = keys.get(i);
+            String val = i < vals.size() ? vals.get(i) : null;
+            if (val == null) obj.putNull(key);
+            else obj.put(key, val);
+        }
+        return obj.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> toStringList(Object arr) {
+        if (arr == null) return List.of();
+        if (arr instanceof List<?> l) return l.stream().map(e -> e == null ? null : e.toString()).toList();
+        if (arr instanceof Object[] a) {
+            List<String> out = new java.util.ArrayList<>();
+            for (Object e : a) out.add(e == null ? null : e.toString());
+            return out;
+        }
+        // PostgreSQL array literal: {a,b,c}
+        String s = arr.toString().strip();
+        if (s.startsWith("{") && s.endsWith("}")) {
+            String inner = s.substring(1, s.length() - 1);
+            if (inner.isEmpty()) return List.of();
+            List<String> out = new java.util.ArrayList<>();
+            for (String part : inner.split(",")) out.add(part.strip());
+            return out;
+        }
+        return List.of(s);
     }
 
     /** row_to_json — convert a row (Object[]) with column names to JSON object. */

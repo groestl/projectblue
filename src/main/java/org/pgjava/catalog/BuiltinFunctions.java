@@ -55,6 +55,7 @@ public final class BuiltinFunctions {
         registerMath(reg);
         registerAggregates(reg);
         registerMisc(reg);
+        registerArrayFunctions(reg);
         registerRangeFunctions(reg);
         registerJsonFunctions(reg);
         registerSrfs(reg);
@@ -1144,6 +1145,73 @@ public final class BuiltinFunctions {
                     @Override public Object result() { return hasValue ? sb.toString() : null; }
                 }
         ));
+
+        PgType json  = t(PgOid.JSON);
+        PgType jsonb = t(PgOid.JSONB);
+        PgType any   = t(PgOid.ANY);
+        PgType text  = t(PgOid.TEXT);
+
+        // json_agg(anyelement) → json
+        reg.registerAggregate(new AggregateDef(
+                3175L, "json_agg", "pg_catalog", List.of(any), json,
+                () -> new AggregateDef.Accumulator() {
+                    final java.util.List<Object> elems = new java.util.ArrayList<>();
+                    @Override public void accumulate(Object v) { elems.add(v); }
+                    @Override public Object result() {
+                        if (elems.isEmpty()) return null;
+                        return JsonOps.toJsonArray(elems);
+                    }
+                }
+        ));
+
+        // jsonb_agg(anyelement) → jsonb
+        reg.registerAggregate(new AggregateDef(
+                3267L, "jsonb_agg", "pg_catalog", List.of(any), jsonb,
+                () -> new AggregateDef.Accumulator() {
+                    final java.util.List<Object> elems = new java.util.ArrayList<>();
+                    @Override public void accumulate(Object v) { elems.add(v); }
+                    @Override public Object result() {
+                        if (elems.isEmpty()) return null;
+                        return JsonOps.toJsonArray(elems);
+                    }
+                }
+        ));
+
+        // json_object_agg(key, value) → json
+        reg.registerAggregate(new AggregateDef(
+                3180L, "json_object_agg", "pg_catalog", List.of(any, any), json,
+                () -> new AggregateDef.Accumulator() {
+                    final java.util.LinkedHashMap<String, Object> map = new java.util.LinkedHashMap<>();
+                    @Override public void accumulate(Object v) {
+                        if (v instanceof Object[] pair && pair.length >= 2) {
+                            String key = pair[0] == null ? null : pair[0].toString();
+                            map.put(key, pair[1]);
+                        }
+                    }
+                    @Override public Object result() {
+                        if (map.isEmpty()) return null;
+                        return JsonOps.jsonObjectFromMap(map);
+                    }
+                }
+        ));
+
+        // jsonb_object_agg(key, value) → jsonb
+        reg.registerAggregate(new AggregateDef(
+                3270L, "jsonb_object_agg", "pg_catalog", List.of(any, any), jsonb,
+                () -> new AggregateDef.Accumulator() {
+                    final java.util.LinkedHashMap<String, Object> map = new java.util.LinkedHashMap<>();
+                    @Override public void accumulate(Object v) {
+                        if (v instanceof Object[] pair && pair.length >= 2) {
+                            String key = pair[0] == null ? null : pair[0].toString();
+                            map.put(key, pair[1]);
+                        }
+                    }
+                    @Override public Object result() {
+                        if (map.isEmpty()) return null;
+                        return JsonOps.jsonObjectFromMap(map);
+                    }
+                }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -1518,7 +1586,7 @@ public final class BuiltinFunctions {
                 args -> buildRange(args[0], args[1], args[2] != null ? args[2].toString() : "[)")));
         reg.register(new FunctionDef(0L, "daterange", "pg_catalog",
                 List.of(date, date), dater, false, false,
-                args -> PgRange.of(args[0], args[1], true, false)));
+                args -> buildRange(args[0], args[1], "[)")));
         reg.register(new FunctionDef(0L, "daterange", "pg_catalog",
                 List.of(date, date, text), dater, false, false,
                 args -> buildRange(args[0], args[1], args[2] != null ? args[2].toString() : "[)")));
@@ -1528,7 +1596,17 @@ public final class BuiltinFunctions {
     private static PgRange buildRange(Object lower, Object upper, String style) {
         boolean lowerInc = style.startsWith("[");
         boolean upperInc = style.endsWith("]");
-        return PgRange.of(lower, upper, lowerInc, upperInc);
+        // Convert String bounds to LocalDate so canonicalize() can increment them
+        Object lo = toDateIfString(lower);
+        Object up = toDateIfString(upper);
+        return PgRange.of(lo, up, lowerInc, upperInc).canonicalize();
+    }
+
+    private static Object toDateIfString(Object v) {
+        if (v instanceof String s) {
+            try { return java.time.LocalDate.parse(s); } catch (Exception ignore) {}
+        }
+        return v;
     }
 
     // =========================================================================
@@ -1620,9 +1698,203 @@ public final class BuiltinFunctions {
                     for (int i = 1; i < args.length; i++) if (args[i] != null) path.add(args[i].toString());
                     return JsonOps.extractPathText(asStr(args[0]), path);
                 }));
+
+        // json_object(keys text[], values text[]) → json  — build object from key/value arrays
+        reg.register(new FunctionDef(0L, "json_object", "pg_catalog", List.of(any, any), json, false, false,
+                args -> JsonOps.jsonObjectFromArrays(args[0], args[1])));
+
+        // row_to_json(record) — handled specially by evaluator; register stub for type resolution
+        // The actual call is intercepted in evalFunction when arg is a table alias (record)
+        reg.register(new FunctionDef(0L, "row_to_json", "pg_catalog", List.of(any), json, false, false,
+                args -> {
+                    // If the argument is already a JSON string (from a record evaluation), return it
+                    if (args[0] instanceof String s && s.startsWith("{")) return s;
+                    // If it's an Object[] (row values without column names), wrap in array notation
+                    return args[0] == null ? null : args[0].toString();
+                }));
     }
 
     private static String asStr(Object v) { return v == null ? null : v.toString(); }
+
+    // =========================================================================
+    // Array functions
+
+    private static void registerArrayFunctions(FunctionRegistry reg) {
+        PgType any  = t(PgOid.ANY);
+        PgType int4 = t(PgOid.INT4);
+        PgType text = t(PgOid.TEXT);
+
+        // array_upper(anyarray, int4) → int4  (1-based upper bound for dim)
+        reg.register(new FunctionDef(2092L, "array_upper", "pg_catalog",
+                List.of(any, int4), int4, true, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    int dim = args[1] instanceof Number n ? n.intValue() : 1;
+                    if (dim != 1) return null;
+                    if (args[0] instanceof List<?> l) return l.isEmpty() ? null : l.size();
+                    if (args[0] instanceof Object[] a) return a.length == 0 ? null : a.length;
+                    return null;
+                }));
+
+        // array_lower(anyarray, int4) → int4  (always 1 for 1-D arrays)
+        reg.register(new FunctionDef(2091L, "array_lower", "pg_catalog",
+                List.of(any, int4), int4, true, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    int dim = args[1] instanceof Number n ? n.intValue() : 1;
+                    if (dim != 1) return null;
+                    boolean isEmpty = (args[0] instanceof List<?> l && l.isEmpty())
+                            || (args[0] instanceof Object[] a && a.length == 0);
+                    return isEmpty ? null : 1;
+                }));
+
+        // array_ndims(anyarray) → int4  (1 for 1-D arrays, 2 for 2-D, etc.)
+        reg.register(new FunctionDef(2176L + 1, "array_ndims", "pg_catalog",
+                List.of(any), int4, true, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    if (args[0] instanceof List<?> l) {
+                        if (!l.isEmpty() && l.get(0) instanceof List<?>) return 2;
+                        return 1;
+                    }
+                    if (args[0] instanceof Object[]) return 1;
+                    return null;
+                }));
+
+        // array_append(anyarray, anyelement) → anyarray
+        reg.register(new FunctionDef(378L, "array_append", "pg_catalog",
+                List.of(any, any), any, false, false,
+                args -> {
+                    List<Object> result = new ArrayList<>();
+                    if (args[0] instanceof List<?> l) result.addAll(l);
+                    else if (args[0] instanceof Object[] a) result.addAll(Arrays.asList(a));
+                    result.add(args[1]);
+                    return result;
+                }));
+
+        // array_prepend(anyelement, anyarray) → anyarray
+        reg.register(new FunctionDef(379L, "array_prepend", "pg_catalog",
+                List.of(any, any), any, false, false,
+                args -> {
+                    List<Object> result = new ArrayList<>();
+                    result.add(args[0]);
+                    if (args[1] instanceof List<?> l) result.addAll(l);
+                    else if (args[1] instanceof Object[] a) result.addAll(Arrays.asList(a));
+                    return result;
+                }));
+
+        // array_cat(anyarray, anyarray) → anyarray
+        reg.register(new FunctionDef(383L, "array_cat", "pg_catalog",
+                List.of(any, any), any, false, false,
+                args -> {
+                    List<Object> result = new ArrayList<>();
+                    if (args[0] instanceof List<?> l) result.addAll(l);
+                    else if (args[0] instanceof Object[] a) result.addAll(Arrays.asList(a));
+                    if (args[1] instanceof List<?> l) result.addAll(l);
+                    else if (args[1] instanceof Object[] a) result.addAll(Arrays.asList(a));
+                    return result;
+                }));
+
+        // array_remove(anyarray, anyelement) → anyarray
+        reg.register(new FunctionDef(3167L, "array_remove", "pg_catalog",
+                List.of(any, any), any, false, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    List<Object> src = args[0] instanceof List<?> l
+                            ? new ArrayList<>(l)
+                            : new ArrayList<>(Arrays.asList((Object[]) args[0]));
+                    Object target = args[1];
+                    src.removeIf(e -> sqlEq(e, target));
+                    return src;
+                }));
+
+        // array_replace(anyarray, anyelement, anyelement) → anyarray
+        reg.register(new FunctionDef(3168L, "array_replace", "pg_catalog",
+                List.of(any, any, any), any, false, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    List<Object> src = args[0] instanceof List<?> l
+                            ? new ArrayList<>(l)
+                            : new ArrayList<>(Arrays.asList((Object[]) args[0]));
+                    Object from = args[1], to = args[2];
+                    src.replaceAll(e -> sqlEq(e, from) ? to : e);
+                    return src;
+                }));
+
+        // array_position(anyarray, anyelement) → int4  (1-based, NULL if not found)
+        reg.register(new FunctionDef(3175L, "array_position", "pg_catalog",
+                List.of(any, any), int4, false, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    List<?> src = args[0] instanceof List<?> l ? l
+                            : Arrays.asList((Object[]) args[0]);
+                    Object target = args[1];
+                    for (int i = 0; i < src.size(); i++) {
+                        if (sqlEq(src.get(i), target)) return i + 1;
+                    }
+                    return null;
+                }));
+
+        // array_positions(anyarray, anyelement) → int4[]
+        reg.register(new FunctionDef(3176L, "array_positions", "pg_catalog",
+                List.of(any, any), any, false, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    List<?> src = args[0] instanceof List<?> l ? l
+                            : Arrays.asList((Object[]) args[0]);
+                    Object target = args[1];
+                    List<Object> positions = new ArrayList<>();
+                    for (int i = 0; i < src.size(); i++) {
+                        if (sqlEq(src.get(i), target)) positions.add(i + 1);
+                    }
+                    return positions;
+                }));
+
+        // string_to_array(text, text, text) → text[]  (3-arg: null_string)
+        reg.register(new FunctionDef(394L, "string_to_array", "pg_catalog",
+                List.of(text, text, text), any, false, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    String str = args[0].toString();
+                    String delim = args[1] == null ? null : args[1].toString();
+                    String nullStr = args[2] == null ? null : args[2].toString();
+                    List<Object> result = new ArrayList<>();
+                    if (delim == null) {
+                        for (char c : str.toCharArray()) result.add(String.valueOf(c));
+                    } else {
+                        String[] parts = str.split(java.util.regex.Pattern.quote(delim), -1);
+                        for (String p : parts) result.add(p.equals(nullStr) ? null : p);
+                    }
+                    return result;
+                }));
+
+        // array_to_string(anyarray, text, text) → text  (3-arg: null replacement)
+        reg.register(new FunctionDef(396L, "array_to_string", "pg_catalog",
+                List.of(any, text, text), text, false, false,
+                args -> {
+                    if (args[0] == null) return null;
+                    List<?> src = args[0] instanceof List<?> l ? l
+                            : Arrays.asList((Object[]) args[0]);
+                    String delim = args[1] == null ? "" : args[1].toString();
+                    String nullRep = args[2] == null ? null : args[2].toString();
+                    StringBuilder sb = new StringBuilder();
+                    boolean first = true;
+                    for (Object e : src) {
+                        if (e == null && nullRep == null) continue;
+                        if (!first) sb.append(delim);
+                        sb.append(e == null ? nullRep : e.toString());
+                        first = false;
+                    }
+                    return sb.toString();
+                }));
+    }
+
+    /** Null-safe equality used for array operations. */
+    private static boolean sqlEq(Object a, Object b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.equals(b);
+    }
 
     // =========================================================================
     // Set-returning functions (SRFs) — registered for FROM-clause use
@@ -1769,18 +2041,35 @@ public final class BuiltinFunctions {
 
         reg.registerSrf(new SrfDef(2178L, "unnest", "pg_catalog",
                 List.of(any), List.of("unnest"), false,
+                args -> unnestToRows(args[0])));
+
+        // unnest(anyarray, anyarray) → setof record  (zips two arrays)
+        reg.registerSrf(new SrfDef(2179L, "unnest", "pg_catalog",
+                List.of(any, any), List.of("unnest", "unnest"), false,
                 args -> {
-                    Object arr = args[0];
-                    if (arr == null) return List.<Object[]>of();
-                    List<Object[]> rows = new ArrayList<>();
-                    if (arr instanceof List<?> l) {
-                        for (Object e : l) rows.add(new Object[]{e});
-                    } else if (arr instanceof Object[] a) {
-                        for (Object e : a) rows.add(new Object[]{e});
-                    } else {
-                        rows.add(new Object[]{arr});
+                    List<Object[]> a = unnestToRows(args[0]);
+                    List<Object[]> b = unnestToRows(args[1]);
+                    int len = Math.max(a.size(), b.size());
+                    List<Object[]> rows = new ArrayList<>(len);
+                    for (int i = 0; i < len; i++) {
+                        Object va = i < a.size() ? a.get(i)[0] : null;
+                        Object vb = i < b.size() ? b.get(i)[0] : null;
+                        rows.add(new Object[]{va, vb});
                     }
                     return rows;
                 }));
+    }
+
+    private static List<Object[]> unnestToRows(Object arr) {
+        if (arr == null) return List.of();
+        List<Object[]> rows = new ArrayList<>();
+        if (arr instanceof List<?> l) {
+            for (Object e : l) rows.add(new Object[]{e});
+        } else if (arr instanceof Object[] a) {
+            for (Object e : a) rows.add(new Object[]{e});
+        } else {
+            rows.add(new Object[]{arr});
+        }
+        return rows;
     }
 }

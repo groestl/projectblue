@@ -72,6 +72,24 @@ public final class ConstraintChecker {
     public static void checkUnique(TableDef table, Object[] values,
                                    List<BTreeIndex> indexes,
                                    RowId excludeRowId) throws SQLException {
+        checkUnique(table, values, indexes, excludeRowId, null, null);
+    }
+
+    /**
+     * MVCC-aware variant: skips index entries whose heap row is not visible
+     * under {@code snap}.  This prevents spurious 23505 errors when a unique
+     * index contains a RowId from an uncommitted or already-deleted row in
+     * another transaction.
+     *
+     * @param heap  the heap table for visibility checks; may be null (falls
+     *              back to treating all RowIds as live)
+     * @param snap  the statement snapshot; may be null (same fallback)
+     * @throws SQLException SQLSTATE 23505 on duplicate
+     */
+    public static void checkUnique(TableDef table, Object[] values,
+                                   List<BTreeIndex> indexes,
+                                   RowId excludeRowId,
+                                   HeapTable heap, TxSnapshot snap) throws SQLException {
         for (BTreeIndex idx : indexes) {
             if (!idx.isUnique()) continue;
             Object[] keyVals = extractKeyValues(idx, table, values);
@@ -87,6 +105,10 @@ public final class ConstraintChecker {
             for (RowId rid : existing) {
                 // Ignore the row being updated
                 if (rid.equals(excludeRowId)) continue;
+                // MVCC: skip RowIds whose heap row is not visible under the current snapshot.
+                // A row that is uncommitted (xmin from another active tx) or already tombstoned
+                // (xmax committed) should not cause a spurious unique violation.
+                if (heap != null && snap != null && heap.lookupByRowId(rid, snap) == null) continue;
                 throw PgErrorException.error("23505",
                         "duplicate key value violates unique constraint \""
                                 + idx.name() + "\"")
@@ -143,6 +165,19 @@ public final class ConstraintChecker {
     public static void checkForeignKey(TableDef table, Object[] values,
                                        HeapStorage storage,
                                        TableResolver resolveTable) throws SQLException {
+        checkForeignKey(table, values, storage, resolveTable, null);
+    }
+
+    /**
+     * MVCC-aware FK check.
+     *
+     * @param snap the current transaction snapshot; {@code null} disables MVCC filtering
+     *             (only tombstoned rows are excluded via {@link HeapTable#fullScan()}).
+     */
+    public static void checkForeignKey(TableDef table, Object[] values,
+                                       HeapStorage storage,
+                                       TableResolver resolveTable,
+                                       TxSnapshot snap) throws SQLException {
         for (Constraint c : table.constraints()) {
             if (!(c instanceof Constraint.ForeignKey fk)) continue;
             // Resolve referenced table
@@ -170,6 +205,8 @@ public final class ConstraintChecker {
             // PostgreSQL: if any FK column is NULL, the constraint is satisfied (MATCH SIMPLE)
             if (anyNull) continue;
 
+            HeapTable refHeap = storage.table(refDef.oid());
+
             // Look for a matching row in the parent table using its unique indexes
             List<BTreeIndex> refIndexes = storage.indexesForTable(refDef.oid());
             List<String> refCols = fk.refColumns().stream()
@@ -182,29 +219,34 @@ public final class ConstraintChecker {
                         .map(ie -> ie.column().toLowerCase()).toList();
                 if (!idxCols.equals(refCols)) continue;
 
-                // Match: look up by FK values in the parent's index
+                // Match: look up by FK values in the parent's index, filtered by MVCC visibility
                 List<RowId> hits = idx.lookupExact(fkVals);
-                if (!hits.isEmpty()) { found = true; break; }
+                for (RowId rid : hits) {
+                    if (snap == null || refHeap == null
+                            || refHeap.lookupByRowId(rid, snap) != null) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
             }
 
-            if (!found) {
+            if (!found && refHeap != null) {
                 // Fall back to full scan if no matching unique index exists
-                HeapTable refHeap = storage.table(refDef.oid());
-                if (refHeap != null) {
-                    java.util.Iterator<Row> iter = refHeap.fullScan();
-                    while (iter.hasNext()) {
-                        Row row = iter.next();
-                        boolean match = true;
-                        for (int i = 0; i < refCols.size(); i++) {
-                            ColumnDef refCol = refDef.column(refCols.get(i));
-                            if (refCol == null) { match = false; break; }
-                            Object refVal = row.values()[refCol.attnum() - 1];
-                            if (!java.util.Objects.equals(fkVals[i], refVal)) {
-                                match = false; break;
-                            }
+                java.util.Iterator<Row> iter = snap != null
+                        ? refHeap.fullScan(snap) : refHeap.fullScan();
+                while (iter.hasNext()) {
+                    Row row = iter.next();
+                    boolean match = true;
+                    for (int i = 0; i < refCols.size(); i++) {
+                        ColumnDef refCol = refDef.column(refCols.get(i));
+                        if (refCol == null) { match = false; break; }
+                        Object refVal = row.values()[refCol.attnum() - 1];
+                        if (!java.util.Objects.equals(fkVals[i], refVal)) {
+                            match = false; break;
                         }
-                        if (match) { found = true; break; }
                     }
+                    if (match) { found = true; break; }
                 }
             }
 
@@ -254,6 +296,16 @@ public final class ConstraintChecker {
             HeapStorage storage, AllTablesSupplier allTables,
             org.pgjava.wal.TransactionManager txMgr, org.pgjava.wal.Transaction tx,
             boolean isDelete, Object[] newValues) throws SQLException {
+        checkForeignKeyParent(parentTable, deletedValues, storage, allTables,
+                txMgr, tx, isDelete, newValues, null);
+    }
+
+    public static void checkForeignKeyParent(
+            TableDef parentTable, Object[] deletedValues,
+            HeapStorage storage, AllTablesSupplier allTables,
+            org.pgjava.wal.TransactionManager txMgr, org.pgjava.wal.Transaction tx,
+            boolean isDelete, Object[] newValues,
+            org.pgjava.executor.Evaluator eval) throws SQLException {
 
         String parentName = parentTable.name().toLowerCase();
 
@@ -318,10 +370,13 @@ public final class ConstraintChecker {
                     }
                     case CASCADE -> {
                         if (isDelete) {
-                            // Delete all referencing child rows
+                            // Delete all referencing child rows, cascading recursively
                             childHeap.constraintLock().lock();
                             try {
                                 for (Row childRow : referencingRows) {
+                                    // Recursively cascade to grandchildren before deleting
+                                    checkForeignKeyParent(childTable, childRow.values(),
+                                            storage, allTables, txMgr, tx, true, null, eval);
                                     try {
                                         txMgr.delete(tx, childTable.oid(), childRow.rowId(),
                                                 childRow.values(),
@@ -388,7 +443,15 @@ public final class ConstraintChecker {
                                 Object[] newChildVals = childRow.values().clone();
                                 for (String col : fk.columns()) {
                                     ColumnDef ccol = childTable.column(col);
-                                    if (ccol != null) newChildVals[ccol.attnum() - 1] = null; // default = null if no explicit default
+                                    if (ccol != null) {
+                                        Object defVal = null;
+                                        if (eval != null && ccol.defaultExpr() != null) {
+                                            try {
+                                                defVal = eval.eval(ccol.defaultExpr(), EvalContext.empty());
+                                            } catch (SQLException ignore) {}
+                                        }
+                                        newChildVals[ccol.attnum() - 1] = defVal;
+                                    }
                                 }
                                 try {
                                     txMgr.update(tx, childTable.oid(), childRow.rowId(),

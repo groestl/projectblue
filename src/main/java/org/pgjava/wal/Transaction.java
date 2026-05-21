@@ -21,6 +21,15 @@ public final class Transaction {
     /** Ordered WAL records written in this transaction (in forward order). */
     private final List<WalRecord> records = Collections.synchronizedList(new ArrayList<>());
 
+    /**
+     * Catalog undo actions: in-memory schema changes that must be reverted if this
+     * transaction rolls back. Stored in forward order; applied in reverse on rollback.
+     * Each entry records: (recordsIndexAtRegistration, undoAction).
+     */
+    private final List<CatalogUndo> catalogUndos = new ArrayList<>();
+
+    private record CatalogUndo(int recordsIndex, Runnable action) {}
+
     /** Stack of savepoint names → index in records list at savepoint time. */
     private final List<SavepointMark> savepoints = new ArrayList<>();
 
@@ -39,6 +48,36 @@ public final class Transaction {
 
     /** Called by TransactionManager after writing a WAL record for this transaction. */
     void addRecord(WalRecord rec) { records.add(rec); }
+
+    /**
+     * Register a catalog undo action. Called by DdlExecutor after each catalog mutation.
+     * On rollback, all catalog undos registered after the current WAL position are applied
+     * in reverse order.
+     */
+    public void addCatalogUndo(Runnable undo) {
+        synchronized (records) {
+            catalogUndos.add(new CatalogUndo(records.size(), undo));
+        }
+    }
+
+    /**
+     * Returns catalog undos that were registered after {@code fromRecordIndex}
+     * (for partial savepoint rollback), in reverse registration order.
+     */
+    List<Runnable> catalogUndosAfter(int fromRecordIndex) {
+        List<Runnable> result = new ArrayList<>();
+        for (int i = catalogUndos.size() - 1; i >= 0; i--) {
+            if (catalogUndos.get(i).recordsIndex() >= fromRecordIndex) {
+                result.add(catalogUndos.get(i).action());
+            }
+        }
+        return result;
+    }
+
+    /** Remove catalog undos registered after {@code fromRecordIndex} (used after rollback). */
+    void removeCatalogUndosAfter(int fromRecordIndex) {
+        catalogUndos.removeIf(u -> u.recordsIndex() >= fromRecordIndex);
+    }
 
     /** Returns an unmodifiable snapshot of all records in forward order. */
     public List<WalRecord> records() {

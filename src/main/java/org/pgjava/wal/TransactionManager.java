@@ -92,16 +92,16 @@ public final class TransactionManager {
 
     /**
      * Roll back a transaction.  Replays WAL records in reverse and undoes
-     * each heap/index mutation.
-     *
-     * <p>DDL undo is logged as a warning — DDL inside a rolled-back transaction
-     * is a known Phase 7 limitation.
+     * each heap/index mutation, then applies catalog undos for any DDL executed
+     * during the transaction.
      */
     public void rollback(Transaction tx) throws IOException, SQLException {
         if (tx.isAborted() || tx.isCommitted()) return;
         assertActive(tx);
 
         undoRecords(tx.records());
+        // Apply catalog undos in reverse order (DDL rollback)
+        for (Runnable undo : tx.catalogUndosAfter(0)) undo.run();
 
         long lsn = wal.nextLsn();
         WalRecord rec = new WalRecord.Rollback(lsn, tx.txid());
@@ -156,6 +156,9 @@ public final class TransactionManager {
 
         List<WalRecord> tail = tx.removeRecordsAfter(idx);
         undoRecords(tail);
+        // Apply catalog undos for DDL executed after the savepoint, in reverse order
+        for (Runnable undo : tx.catalogUndosAfter(idx)) undo.run();
+        tx.removeCatalogUndosAfter(idx);
         // Remove savepoints created after the target, but keep the target itself
         tx.trimSavepointsAfter(idx);
 
@@ -320,7 +323,7 @@ public final class TransactionManager {
                 case WalRecord.Delete del -> undoDelete(del);
                 case WalRecord.Update upd -> undoUpdate(upd);
                 case WalRecord.Ddl ddl -> {
-                    LOG.warning("DDL undo not supported in Phase 7: " + ddl.sql());
+                    // DDL undo is handled via catalogUndos, not WAL replay
                 }
                 default -> { /* BEGIN, COMMIT, SAVEPOINT etc. — nothing to undo */ }
             }

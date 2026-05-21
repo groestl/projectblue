@@ -182,17 +182,19 @@ public final class UpdateOp extends Operator {
             }
 
             ConstraintChecker.checkNotNull(def, newVals);
-            ConstraintChecker.checkUnique(def, newVals, indexes, srcRow.rowId());
+            ConstraintChecker.checkUnique(def, newVals, indexes, srcRow.rowId(),
+                    heap, txMgr.snapshotFor(tx.txid()));
             ConstraintChecker.checkCheck(def, newVals, eval);
             ConstraintChecker.checkDomainAndEnum(def, newVals, eval);
             if (tableResolver != null) {
-                ConstraintChecker.checkForeignKey(def, newVals, storage, tableResolver);
+                ConstraintChecker.checkForeignKey(def, newVals, storage, tableResolver,
+                        txMgr.snapshotFor(tx.txid()));
             }
             // Parent-side FK enforcement (CASCADE, SET NULL, RESTRICT, etc.)
             if (allTablesSupplier != null) {
                 ConstraintChecker.checkForeignKeyParent(
                         def, oldVals, storage, allTablesSupplier, txMgr, tx,
-                        false, newVals);
+                        false, newVals, eval);
             }
 
             try {

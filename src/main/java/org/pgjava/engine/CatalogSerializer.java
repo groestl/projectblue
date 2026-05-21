@@ -303,12 +303,16 @@ final class CatalogSerializer {
      * Other schemas are created with their saved OIDs.
      */
     static void load(CatalogManager catalog, Database database, Path dataDir) throws IOException {
+        org.pgjava.types.PgTypeRegistry registry = (database != null)
+                ? database.typeRegistry()
+                : org.pgjava.types.PgTypeRegistry.INSTANCE;
+
         JsonNode root = MAPPER.readTree(dataDir.resolve(CATALOG_FILE).toFile());
 
         long nextOid = root.get("nextOid").asLong();
 
         for (JsonNode schemaNode : root.get("schemas")) {
-            deserializeSchema(catalog, schemaNode);
+            deserializeSchema(catalog, registry, schemaNode);
         }
 
         // Deserialize user-defined functions
@@ -327,7 +331,9 @@ final class CatalogSerializer {
         load(catalog, null, dataDir);
     }
 
-    private static void deserializeSchema(CatalogManager catalog, JsonNode node) throws IOException {
+    private static void deserializeSchema(CatalogManager catalog,
+                                          org.pgjava.types.PgTypeRegistry registry,
+                                          JsonNode node) throws IOException {
         long   oid  = node.get("oid").asLong();
         String name = node.get("name").asText();
 
@@ -341,12 +347,12 @@ final class CatalogSerializer {
         // enum/domain types by OID (types array may be absent in older catalog files)
         if (node.has("types")) {
             for (JsonNode typeNode : node.get("types")) {
-                deserializeType(schema, typeNode);
+                deserializeType(schema, registry, typeNode);
             }
         }
 
         for (JsonNode tableNode : node.get("tables")) {
-            deserializeTable(schema, tableNode);
+            deserializeTable(schema, registry, tableNode);
         }
 
         for (JsonNode seqNode : node.get("sequences")) {
@@ -358,7 +364,9 @@ final class CatalogSerializer {
         }
     }
 
-    private static void deserializeTable(Schema schema, JsonNode node) {
+    private static void deserializeTable(Schema schema,
+                                          org.pgjava.types.PgTypeRegistry registry,
+                                          JsonNode node) {
         long   oid        = node.get("oid").asLong();
         String name       = node.get("name").asText();
         String schemaName = node.get("schemaName").asText();
@@ -367,7 +375,7 @@ final class CatalogSerializer {
         TableDef t = new TableDef(oid, name, schemaName, temp);
 
         for (JsonNode colNode : node.get("columns")) {
-            t.addColumn(deserializeColumn(colNode));
+            t.addColumn(deserializeColumn(registry, colNode));
         }
         for (JsonNode conNode : node.get("constraints")) {
             t.addConstraint(deserializeConstraint(conNode));
@@ -387,7 +395,8 @@ final class CatalogSerializer {
         schema.addTable(t);
     }
 
-    private static ColumnDef deserializeColumn(JsonNode node) {
+    private static ColumnDef deserializeColumn(org.pgjava.types.PgTypeRegistry registry,
+                                               JsonNode node) {
         String        colName  = node.get("name").asText();
         int           attnum   = node.get("attnum").asInt();
         int           typeOid  = node.get("typeOid").asInt();
@@ -395,7 +404,10 @@ final class CatalogSerializer {
         boolean       nullable = node.get("nullable").asBoolean();
         GeneratedKind gen      = GeneratedKind.valueOf(node.get("generated").asText());
 
-        PgType type = PgTypeRegistry.INSTANCE.byOid(typeOid);
+        // Look in the database-local registry first (finds user-defined types like enums/domains),
+        // then fall back to the global built-in registry.
+        PgType type = registry.byOid(typeOid);
+        if (type == null) type = PgTypeRegistry.INSTANCE.byOid(typeOid);
         if (type == null) type = PgTypeRegistry.INSTANCE.text(); // fallback to text
 
         String collation = node.has("collation") ? node.get("collation").asText(null) : null;
@@ -513,7 +525,9 @@ final class CatalogSerializer {
         schema.addView(new ViewDef(oid, name, schemaName, sql, parsedDef, aliases));
     }
 
-    private static void deserializeType(Schema schema, JsonNode node) {
+    private static void deserializeType(Schema schema,
+                                         org.pgjava.types.PgTypeRegistry registry,
+                                         JsonNode node) {
         int    oid  = node.get("oid").asInt();
         String name = node.get("name").asText();
         String kind = node.get("kind").asText();
@@ -526,7 +540,9 @@ final class CatalogSerializer {
             }
             case "DOMAIN" -> {
                 int baseOid = node.get("baseTypeOid").asInt();
-                PgType baseType = PgTypeRegistry.INSTANCE.byOid(baseOid);
+                // Look in per-database registry first (for domain-of-domain), then built-ins
+                PgType baseType = registry.byOid(baseOid);
+                if (baseType == null) baseType = PgTypeRegistry.INSTANCE.byOid(baseOid);
                 if (baseType == null) baseType = PgTypeRegistry.INSTANCE.text();
                 boolean notNull = node.has("notNull") && node.get("notNull").asBoolean();
 
@@ -550,7 +566,8 @@ final class CatalogSerializer {
 
         if (type != null) {
             schema.addType(type);
-            PgTypeRegistry.INSTANCE.register(type);
+            // Register into the per-database registry only — not the JVM-global INSTANCE.
+            registry.register(type);
         }
     }
 

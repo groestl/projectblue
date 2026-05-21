@@ -98,6 +98,16 @@ public final class TriggerExecutor {
                                          TableDef viewTableDef,
                                          Database db, List<String> searchPath)
             throws SQLException {
+        return fireInsteadOf(viewTriggers, event, newVals, oldVals, viewName, viewSchema,
+                viewTableDef, null, db, searchPath);
+    }
+
+    public static boolean fireInsteadOf(List<TriggerDef> viewTriggers, int event,
+                                         Object[] newVals, Object[] oldVals,
+                                         String viewName, String viewSchema,
+                                         TableDef viewTableDef, String[] columnNames,
+                                         Database db, List<String> searchPath)
+            throws SQLException {
         List<TriggerDef> matching = new ArrayList<>();
         for (TriggerDef t : viewTriggers) {
             if (t.timing() == TriggerDef.INSTEAD_OF && t.firesOn(event) && t.row()) {
@@ -116,7 +126,7 @@ public final class TriggerExecutor {
             } else {
                 // Fallback: build a minimal trigger context directly
                 invokeTriggerFunctionMinimal(trig, event, newVals, oldVals,
-                        viewName, viewSchema, db, searchPath);
+                        viewName, viewSchema, columnNames, db, searchPath);
             }
         }
         return true;
@@ -315,6 +325,7 @@ public final class TriggerExecutor {
     private static void invokeTriggerFunctionMinimal(TriggerDef trig, int event,
                                                       Object[] newVals, Object[] oldVals,
                                                       String viewName, String viewSchema,
+                                                      String[] columnNames,
                                                       Database db, List<String> searchPath)
             throws SQLException {
         int depth = triggerDepth.get();
@@ -353,7 +364,8 @@ public final class TriggerExecutor {
                     viewName, viewSchema,
                     trig.args() != null ? trig.args().toArray(new String[0]) : new String[0], null,
                     newVals != null ? newVals.clone() : null,
-                    oldVals != null ? oldVals.clone() : null
+                    oldVals != null ? oldVals.clone() : null,
+                    columnNames
             );
 
             PENDING_TRIGGER_CTX.set(trigCtx);

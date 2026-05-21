@@ -237,8 +237,9 @@ class Phase12RangeTypesTest {
         try (Session s = s()) {
             QueryResult r = s.execute("SELECT int4range(1, 10, '[]')");
             PgRange range = (PgRange) r.rows().get(0)[0];
+            // PostgreSQL canonicalizes [1,10] → [1,11): lower inclusive, upper exclusive
             assertTrue(range.lowerInc());
-            assertTrue(range.upperInc());
+            assertFalse(range.upperInc());
         }
     }
 

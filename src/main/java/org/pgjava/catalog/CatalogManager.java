@@ -42,6 +42,9 @@ public final class CatalogManager {
 
     private final AtomicLong oidGen = new AtomicLong(16384L);
 
+    /** Session-level (per-thread) last value returned by nextval() — for lastval(). */
+    private final ThreadLocal<Long> sessionLastVal = new ThreadLocal<>();
+
     // -------------------------------------------------------------------------
 
     public CatalogManager(String dbName) {
@@ -102,7 +105,11 @@ public final class CatalogManager {
                 1574L, "nextval", "pg_catalog",
                 List.of(textType), int8Type,
                 true, false,
-                args -> resolveSequenceByName((String) args[0]).nextval()
+                args -> {
+                    long v = resolveSequenceByName((String) args[0]).nextval();
+                    sessionLastVal.set(v);
+                    return v;
+                }
         ));
 
         // currval(text) → int8
@@ -124,6 +131,35 @@ public final class CatalogManager {
                     seq.setval(val);
                     return val;
                 }
+        ));
+
+        var boolType = PgTypeRegistry.INSTANCE.byOid(PgOid.BOOL);
+
+        // setval(text, int8, bool) → int8
+        // When is_called=false, next nextval() returns the given value (don't advance)
+        functions.register(new FunctionDef(
+                1219L, "setval", "pg_catalog",
+                List.of(textType, int8Type, boolType), int8Type,
+                true, false,
+                args -> {
+                    SequenceDef seq = resolveSequenceByName((String) args[0]);
+                    long val = toLong(args[1]);
+                    boolean isCalled = args[2] == null || Boolean.TRUE.equals(args[2]);
+                    if (isCalled) {
+                        seq.setval(val);
+                    } else {
+                        seq.setvalNotCalled(val);
+                    }
+                    return val;
+                }
+        ));
+
+        // lastval() → int8
+        functions.register(new FunctionDef(
+                2559L, "lastval", "pg_catalog",
+                List.of(), int8Type,
+                true, false,
+                args -> lastval()
         ));
     }
 
@@ -335,6 +371,14 @@ public final class CatalogManager {
             }
         }
         return null;
+    }
+
+    private long lastval() throws SQLException {
+        Long v = sessionLastVal.get();
+        if (v == null)
+            throw PgErrorException.error("55000",
+                    "lastval is not yet defined in this session").build();
+        return v;
     }
 
     /**

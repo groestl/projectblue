@@ -216,13 +216,21 @@ class Phase7StorageTest {
 
     @Test
     void uniqueIndexRejectsDuplicate() throws SQLException {
+        // Uniqueness is enforced by ConstraintChecker, not BTreeIndex.insert().
+        // BTreeIndex.insert() appends unconditionally to support WAL undo paths.
         BTreeIndex idx = makeUniqueIndex("id");
         RowId r1 = new RowId(100L, 0);
-        RowId r2 = new RowId(100L, 1);
+
+        // Insert the first row (pre-existing, xmin=0 → always visible)
+        heapTable.insert(new Object[]{1, "alice", true}, 0L);
         idx.insert(new Object[]{1}, r1);
 
+        // checkUnique with a snapshot that sees the committed row must throw 23505
+        TxSnapshot snap = new TxSnapshot(99L, Set.of());
+        Object[] dupeVals = new Object[]{1, "bob", false};
         SQLException ex = assertThrows(SQLException.class,
-                () -> idx.insert(new Object[]{1}, r2));
+                () -> ConstraintChecker.checkUnique(tableDef, dupeVals,
+                        List.of(idx), null, heapTable, snap));
         assertEquals("23505", ex.getSQLState());
     }
 

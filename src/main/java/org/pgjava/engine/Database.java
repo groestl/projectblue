@@ -40,7 +40,8 @@ public final class Database {
     private final NotificationBus    notifyBus = new NotificationBus();
     private final org.pgjava.storage.AdvisoryLockManager advisoryLocks =
             new org.pgjava.storage.AdvisoryLockManager();
-    private final org.pgjava.types.PgCollation collation;
+    private final org.pgjava.types.PgCollation   collation;
+    private final org.pgjava.types.PgTypeRegistry typeRegistry;
 
     /** Non-null only for persistent databases. */
     private final Path dataDir;
@@ -96,29 +97,31 @@ public final class Database {
 
     /** In-memory constructor. */
     Database(String name) {
-        this.name      = name;
-        this.dataDir   = null;
-        this.catalog   = new CatalogManager(name);
-        this.storage   = new HeapStorage();
-        this.wal       = new WalWriter();                  // in-memory mode
-        this.txManager = new TransactionManager(storage, wal);
-        this.collation = org.pgjava.types.PgCollation.DEFAULT;
+        this.name         = name;
+        this.dataDir      = null;
+        this.catalog      = new CatalogManager(name);
+        this.storage      = new HeapStorage();
+        this.wal          = new WalWriter();                  // in-memory mode
+        this.txManager    = new TransactionManager(storage, wal);
+        this.collation    = org.pgjava.types.PgCollation.DEFAULT;
+        this.typeRegistry = org.pgjava.types.PgTypeRegistry.newDatabase();
         registerPgLocks();
     }
 
     /** Persistent constructor — recovers from disk if catalog.json exists. */
     private Database(String name, Path dataDir) throws IOException {
-        this.name    = name;
-        this.dataDir = dataDir;
-        this.catalog = new CatalogManager(name);
-        this.storage = new HeapStorage();
-        this.wal     = new WalWriter(dataDir.resolve("wal"));
-        this.txManager = new TransactionManager(storage, wal);
-        this.collation = org.pgjava.types.PgCollation.DEFAULT;
+        this.name         = name;
+        this.dataDir      = dataDir;
+        this.catalog      = new CatalogManager(name);
+        this.storage      = new HeapStorage();
+        this.wal          = new WalWriter(dataDir.resolve("wal"));
+        this.txManager    = new TransactionManager(storage, wal);
+        this.collation    = org.pgjava.types.PgCollation.DEFAULT;
+        this.typeRegistry = org.pgjava.types.PgTypeRegistry.newDatabase();
         registerPgLocks();
 
         if (CatalogSerializer.exists(dataDir)) {
-            CatalogSerializer.load(catalog, dataDir);
+            CatalogSerializer.load(catalog, this, dataDir);
             HeapSerializer.loadAll(storage, catalog, dataDir);
         }
     }
@@ -182,14 +185,15 @@ public final class Database {
     // Accessors
     // =========================================================================
 
-    public String             name()      { return name; }
-    public CatalogManager     catalog()   { return catalog; }
-    public HeapStorage        storage()   { return storage; }
-    public WalWriter          wal()       { return wal; }
-    public TransactionManager txManager() { return txManager; }
-    public NotificationBus    notifyBus() { return notifyBus; }
+    public String             name()         { return name; }
+    public CatalogManager     catalog()      { return catalog; }
+    public HeapStorage        storage()      { return storage; }
+    public WalWriter          wal()          { return wal; }
+    public TransactionManager txManager()    { return txManager; }
+    public NotificationBus    notifyBus()    { return notifyBus; }
     public org.pgjava.storage.AdvisoryLockManager advisoryLocks() { return advisoryLocks; }
-    public org.pgjava.types.PgCollation collation() { return collation; }
+    public org.pgjava.types.PgCollation   collation()    { return collation; }
+    public org.pgjava.types.PgTypeRegistry typeRegistry() { return typeRegistry; }
 
     public boolean isPersistent() { return dataDir != null; }
 
@@ -245,13 +249,29 @@ public final class Database {
 
     /** Cloning constructor: accepts pre-built catalog and storage, creates fresh tx state. */
     private Database(String name, CatalogManager catalog, HeapStorage storage) {
-        this.name      = name;
-        this.dataDir   = null;
-        this.catalog   = catalog;
-        this.storage   = storage;
-        this.wal       = new WalWriter();
-        this.txManager = new TransactionManager(storage, wal);
-        this.collation = org.pgjava.types.PgCollation.DEFAULT;
+        this.name         = name;
+        this.dataDir      = null;
+        this.catalog      = catalog;
+        this.storage      = storage;
+        this.wal          = new WalWriter();
+        this.txManager    = new TransactionManager(storage, wal);
+        this.collation    = org.pgjava.types.PgCollation.DEFAULT;
+        this.typeRegistry = buildTypeRegistryFromCatalog(catalog);
         registerPgLocks();
+    }
+
+    /**
+     * Build a per-database type registry from the catalog's schema types.
+     * Used when cloning a database — the cloned catalog already has all
+     * user-defined types in its schemas; we just need to re-register them.
+     */
+    private static org.pgjava.types.PgTypeRegistry buildTypeRegistryFromCatalog(CatalogManager catalog) {
+        org.pgjava.types.PgTypeRegistry reg = org.pgjava.types.PgTypeRegistry.newDatabase();
+        for (org.pgjava.catalog.Schema schema : catalog.allSchemas().values()) {
+            for (org.pgjava.types.PgType t : schema.types().values()) {
+                reg.register(t);
+            }
+        }
+        return reg;
     }
 }

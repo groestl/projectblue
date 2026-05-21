@@ -1035,10 +1035,17 @@ public final class PlPgSqlInterpreter {
             while ((row = root.next()) != null) {
                 scope.setFound(true);
                 Object[] vals = row.values();
-                if (targets.size() == 1 && vals.length > 1) {
-                    // Single target with multiple columns: assign as composite record
-                    targetVars[0].setValue(vals.clone());
-                    targetVars[0].setColumnNames(root.schema().names());
+                if (targets.size() == 1) {
+                    PlPgSqlVariable tv = targetVars[0];
+                    boolean isRecord = tv.typeName() == null
+                            || "record".equalsIgnoreCase(tv.typeName());
+                    if (isRecord || vals.length > 1) {
+                        // RECORD target or multi-column: assign as composite
+                        tv.setValue(vals.clone());
+                        tv.setColumnNames(root.schema().names());
+                    } else {
+                        tv.setValue(vals[0]);
+                    }
                 } else {
                     for (int i = 0; i < targetVars.length && i < vals.length; i++) {
                         targetVars[i].setValue(vals[i]);
@@ -1506,7 +1513,7 @@ public final class PlPgSqlInterpreter {
             @Override
             public Object resolveField(String qualifier, String field) throws SQLException {
                 // Trigger context: NEW/OLD use TableDef column lookup
-                if (triggerCtx != null && triggerCtx.tableDef() != null) {
+                if (triggerCtx != null) {
                     Object[] row = null;
                     if ("new".equalsIgnoreCase(qualifier)) {
                         PlPgSqlVariable v = scope.resolve("new");
@@ -1516,10 +1523,21 @@ public final class PlPgSqlInterpreter {
                         row = v != null ? (Object[]) v.value() : triggerCtx.oldRow();
                     }
                     if (row != null) {
-                        var col = triggerCtx.tableDef().column(field);
-                        if (col != null) {
-                            int idx = col.attnum() - 1;
-                            return idx < row.length ? row[idx] : null;
+                        // Try tableDef column lookup first
+                        if (triggerCtx.tableDef() != null) {
+                            var col = triggerCtx.tableDef().column(field);
+                            if (col != null) {
+                                int idx = col.attnum() - 1;
+                                return idx < row.length ? row[idx] : null;
+                            }
+                        }
+                        // Fall back to columnNames array (for INSTEAD OF triggers on views)
+                        if (triggerCtx.columnNames() != null) {
+                            for (int i = 0; i < triggerCtx.columnNames().length; i++) {
+                                if (field.equalsIgnoreCase(triggerCtx.columnNames()[i])) {
+                                    return i < row.length ? row[i] : null;
+                                }
+                            }
                         }
                     }
                 }

@@ -156,11 +156,37 @@ public final class ResultSetComparator {
         if (isInterval(a) || isInterval(b)) {
             return normalizeIntervalMicros(a) == normalizeIntervalMicros(b);
         }
+        // JSON comparison: must come BEFORE array check because JSON objects also start with '{'.
+        // Try semantic JSON equality first; only fall back to array normalization for PG array literals.
+        String as = a.toString(), bs = b.toString();
+        if (isJsonLike(as) && isJsonLike(bs)) {
+            if (as.equals(bs)) return true;
+            // Try JSON comparison; if both parse as JSON they compare semantically
+            if (jsonEquals(as, bs)) return true;
+        }
         // Array comparison: PG returns java.sql.Array ("{1,2,3}"), pgjava returns List ("[1, 2, 3]")
         if (isArray(a) || isArray(b)) {
             return normalizeArrayString(a).equals(normalizeArrayString(b));
         }
-        return Objects.equals(a.toString(), b.toString());
+        return Objects.equals(as, bs);
+    }
+
+    private static boolean isJsonLike(String s) {
+        if (s == null || s.isEmpty()) return false;
+        char c = s.charAt(0);
+        return c == '{' || c == '[';
+    }
+
+    private static boolean jsonEquals(String a, String b) {
+        try {
+            com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+            com.fasterxml.jackson.databind.JsonNode na = mapper.readTree(a);
+            com.fasterxml.jackson.databind.JsonNode nb = mapper.readTree(b);
+            return na.equals(nb);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static boolean isTemporal(Object v) {

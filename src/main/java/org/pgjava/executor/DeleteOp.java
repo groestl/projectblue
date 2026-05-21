@@ -113,7 +113,7 @@ public final class DeleteOp extends Operator {
             if (allTablesSupplier != null) {
                 ConstraintChecker.checkForeignKeyParent(
                         def, oldVals, storage, allTablesSupplier, txMgr, tx,
-                        true, null);
+                        true, null, eval);
             }
 
             try {

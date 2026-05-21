@@ -847,21 +847,10 @@ class PgConnectionHandler extends ChannelInboundHandlerAdapter {
 
     /** Return [pgTypeOid, typeLen] for a column. */
     private static int[] pgTypeInfo(ColumnMeta col) {
-        // For Types.OTHER, disambiguate by typeName
-        if (col.sqlType() == Types.OTHER && col.typeName() != null) {
-            return switch (col.typeName().toLowerCase()) {
-                case "uuid"     -> new int[]{2950, 16};
-                case "interval" -> new int[]{1186, 16};
-                case "json"     -> new int[]{114,  -1};
-                case "jsonb"    -> new int[]{3802, -1};
-                case "int4range"  -> new int[]{3904, -1};
-                case "int8range"  -> new int[]{3926, -1};
-                case "numrange"   -> new int[]{3906, -1};
-                case "tsrange"    -> new int[]{3908, -1};
-                case "tstzrange"  -> new int[]{3910, -1};
-                case "daterange"  -> new int[]{3912, -1};
-                default         -> new int[]{25, -1};
-            };
+        // Prefer exact typeName lookup when available — more precise than sqlType
+        if (col.typeName() != null) {
+            int[] byName = pgTypeInfoByName(col.typeName().toLowerCase());
+            if (byName != null) return byName;
         }
         return switch (col.sqlType()) {
             case Types.INTEGER   -> new int[]{23,   4};
@@ -882,6 +871,51 @@ class PgConnectionHandler extends ChannelInboundHandlerAdapter {
             case Types.VARCHAR   -> new int[]{1043,-1};
             case Types.TINYINT   -> new int[]{21,   2}; // map to int2
             default              -> new int[]{25,  -1}; // text
+        };
+    }
+
+    private static int[] pgTypeInfoByName(String typeName) {
+        return switch (typeName) {
+            case "text"     -> new int[]{25,   -1};
+            case "int2"     -> new int[]{21,    2};
+            case "int4"     -> new int[]{23,    4};
+            case "int8"     -> new int[]{20,    8};
+            case "float4"   -> new int[]{700,   4};
+            case "float8"   -> new int[]{701,   8};
+            case "numeric"  -> new int[]{1700, -1};
+            case "bool"     -> new int[]{16,    1};
+            case "bytea"    -> new int[]{17,   -1};
+            case "date"     -> new int[]{1082,  4};
+            case "time"     -> new int[]{1083,  8};
+            case "timetz"   -> new int[]{1266, 12};
+            case "timestamp" -> new int[]{1114, 8};
+            case "timestamptz" -> new int[]{1184, 8};
+            case "interval" -> new int[]{1186, 16};
+            case "varchar"  -> new int[]{1043, -1};
+            case "bpchar"   -> new int[]{1042, -1};
+            case "name"     -> new int[]{19,   -1};
+            case "uuid"     -> new int[]{2950, 16};
+            case "json"     -> new int[]{114,  -1};
+            case "jsonb"    -> new int[]{3802, -1};
+            case "int4range"  -> new int[]{3904, -1};
+            case "int8range"  -> new int[]{3926, -1};
+            case "numrange"   -> new int[]{3906, -1};
+            case "tsrange"    -> new int[]{3908, -1};
+            case "tstzrange"  -> new int[]{3910, -1};
+            case "daterange"  -> new int[]{3912, -1};
+            // Array types
+            case "int2[]"   -> new int[]{1005, -1};
+            case "int4[]"   -> new int[]{1007, -1};
+            case "int8[]"   -> new int[]{1016, -1};
+            case "float4[]" -> new int[]{1021, -1};
+            case "float8[]" -> new int[]{1022, -1};
+            case "numeric[]" -> new int[]{1231, -1};
+            case "bool[]"   -> new int[]{1000, -1};
+            case "text[]"   -> new int[]{1009, -1};
+            case "date[]"   -> new int[]{1182, -1};
+            case "timestamp[]" -> new int[]{1115, -1};
+            case "timestamptz[]" -> new int[]{1185, -1};
+            default -> null;
         };
     }
 }
